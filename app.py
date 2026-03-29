@@ -3,22 +3,57 @@ import requests
 
 app = Flask(__name__)
 
-BOT_TOKEN = "8763117864:AAEkKkFXvuLSHDVDqyRY3a4E5Jlb5VtkA4A"
-CHAT_ID = 7189582757
+BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN"
+CHAT_ID = "PASTE_YOUR_CHAT_ID"
+
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, json={
+        "chat_id": CHAT_ID,
+        "text": text
+    })
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
-    pair = data.get("pair", "Unknown")
-    signal = data.get("signal", "No signal")
-    price = data.get("price", "N/A")
 
-    msg = f"📊 {pair}\n⚡ {signal}\n💰 {price}"
+    if "message" in data:
+        msg = data["message"]
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={
-        "chat_id": CHAT_ID,
-        "text": msg
-    })
+        # 📸 Image handler
+        if "photo" in msg:
+            caption = msg.get("caption", "No caption")
 
-    return "OK"
+            response = f"""
+📊 SETUP LOGGED
+
+🧾 {caption}
+
+🧠 Checklist:
+✅ Trend
+✅ BOS
+✅ Imbalance
+✅ OB Tap
+
+⚠️ Stay disciplined.
+"""
+            send_telegram(response)
+
+        # 🧠 Checklist command
+        elif "text" in msg:
+            if msg["text"] == "/check":
+                checklist = """
+🧠 A+ CHECKLIST
+
+✅ 1H Trend clear?
+✅ BOS confirmed?
+✅ Imbalance present?
+✅ OB tapped?
+✅ Session valid?
+✅ News nearby?
+
+⚠️ If ANY is NO → DON'T TRADE
+"""
+                send_telegram(checklist)
+
+    return "ok"
