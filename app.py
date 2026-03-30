@@ -16,7 +16,12 @@ def send_telegram(chat_id, text):
 
 @app.route("/")
 def home():
-    # Ping this route = bot messages you automatically
+    # Silent ping - don't send Telegram message
+    return "ok", 200
+
+@app.route("/startup")
+def startup():
+    # Only message you on actual startup
     send_telegram(CHAT_ID, "✅ JP mini bot is live and running!")
     return "ok", 200
 
