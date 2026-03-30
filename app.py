@@ -9,6 +9,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 EXCHANGE_API_KEY = os.environ.get("EXCHANGE_API_KEY")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 def send_telegram(chat_id, text, reply_markup=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -57,58 +58,48 @@ def get_forex_price(pair):
     except:
         return None
 
-def ask_claude(prompt):
-    url = "https://api.anthropic.com/v1/messages"
+def ask_groq(prompt):
+    url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
-        "x-api-key": CLAUDE_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
+        "Authorization": f"Bearer {os.environ.get('GROQ_API_KEY')}",
+        "Content-Type": "application/json"
     }
     payload = {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "llama-3.3-70b-versatile",
         "max_tokens": 300,
         "messages": [
+            {"role": "system", "content": "You are a sharp SMC/ICT forex trading analyst. Keep responses short, smart and actionable."},
             {"role": "user", "content": prompt}
         ]
     }
     try:
         res = requests.post(url, headers=headers, json=payload)
-        return res.json()["content"][0]["text"]
+        return res.json()["choices"][0]["message"]["content"]
     except:
         return None
 
-def ask_claude_image(base64_image, pair_context="forex"):
-    url = "https://api.anthropic.com/v1/messages"
+def ask_groq_image(base64_image):
+    url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
-        "x-api-key": CLAUDE_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
+        "Authorization": f"Bearer {os.environ.get('GROQ_API_KEY')}",
+        "Content-Type": "application/json"
     }
     payload = {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "llama-3.2-11b-vision-preview",
         "max_tokens": 400,
         "messages": [
             {
                 "role": "user",
                 "content": [
                     {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": base64_image
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
                         }
                     },
                     {
                         "type": "text",
-                        "text": """You are a sharp SMC/ICT trading analyst. Analyse this chart and give a short, smart breakdown:
-
-1. Trend bias (bullish/bearish/ranging)
-2. Key zone to watch (OB, FVG, or liquidity level)
-3. What price needs to do to confirm entry
-4. One line risk note
-
-Keep it short, sharp and SMC-flavoured. No fluff."""
+                        "text": "You are a sharp SMC/ICT trading analyst. Analyse this chart and give me: 1. Trend bias 2. Key zone to watch 3. Entry condition 4. One risk note. Keep it short and sharp."
                     }
                 ]
             }
@@ -116,7 +107,7 @@ Keep it short, sharp and SMC-flavoured. No fluff."""
     }
     try:
         res = requests.post(url, headers=headers, json=payload)
-        return res.json()["content"][0]["text"]
+        return res.json()["choices"][0]["message"]["content"]
     except:
         return None
 
@@ -139,7 +130,7 @@ def startup():
 
 @app.route("/testai")
 def test_ai():
-    result = ask_claude("Say hello in one word.")
+    result = ask_groq("Say hello in one word.")
     return result if result else "FAILED - AI unavailable"
     
 @app.route("/webhook", methods=["POST"])
