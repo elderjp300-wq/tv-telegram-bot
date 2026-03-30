@@ -39,6 +39,26 @@ def answer_callback(callback_query_id):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
     requests.post(url, json={"callback_query_id": callback_query_id})
 
+def get_forex_price(pair):
+    api_key = os.environ.get("EXCHANGE_API_KEY")
+    
+    pair_map = {
+        "EURUSD": ("EUR", "USD"),
+        "USDJPY": ("USD", "JPY"),
+        "GBPUSD": ("GBP", "USD"),
+        "XAUUSD": ("XAU", "USD")
+    }
+    
+    base, quote = pair_map[pair]
+    url = f"https://v6.exchangerate-api.com/v6/{api_key}/pair/{base}/{quote}"
+    
+    try:
+        res = requests.get(url).json()
+        rate = res["conversion_rate"]
+        return rate
+    except:
+        return None
+        
 @app.route("/")
 def home():
     return "ok", 200
@@ -75,7 +95,20 @@ def webhook():
 
         elif action.startswith("price_"):
             pair = action.replace("price_", "")
-            send_telegram(chat_id, f"⏳ Fetching {pair} price...", main_menu())
+            rate = get_forex_price(pair)
+    
+            if rate:
+                display = pair if pair != "XAUUSD" else "GOLD"
+                send_telegram(chat_id, f"""
+        📊 *{display}*
+
+        💰 Price: `{rate}`
+        🕐 Live rate
+
+        _Tap a pair to refresh_
+        """, main_menu())
+            else:
+                send_telegram(chat_id, "⚠️ Could not fetch price. Try again.", main_menu())
 
     # Handle text commands
     if "message" in data:
