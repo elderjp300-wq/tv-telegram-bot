@@ -137,6 +137,11 @@ def startup():
     send_telegram(CHAT_ID, "✅ JP mini bot is live and running!")
     return "ok", 200
 
+@app.route("/testai")
+def test_ai():
+    result = ask_claude("Say hello in one word.")
+    return result if result else "FAILED - AI unavailable"
+    
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
