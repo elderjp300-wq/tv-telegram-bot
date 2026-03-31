@@ -244,8 +244,30 @@ def webhook():
         🧠 Running SMC read...
         """, main_menu())
 
-                # Then run AI separately
-                prompt = f"""You are a sharp SMC/ICT trading analyst.
+                # Then run AI separately_________
+                # TEMP FAKE STRUCTURE (we upgrade later)______
+                trend = "bullish" if rate % 2 > 1 else "bearish"
+                bos = "Yes" if rate % 3 > 1 else "No"
+
+                prompt = f"""
+                You are a strict SMC/ICT trading analyst.
+
+                Market Structure:
+                - Trend: {trend}
+                - BOS: {bos}
+                - Price: {rate}
+
+                Only give high probability setups.
+                If conditions are weak, say NO TRADE.
+
+                Give:
+                1. Bias
+                2. Key zone
+                3. Entry
+                4. Risk note
+
+                Keep it sharp.
+                """
         Current {display} price is {rate}.
 
         Give me:
