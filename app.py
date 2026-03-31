@@ -4,10 +4,7 @@ import requests
 import os
 import base64
 
-app = Flask(__name__):
-scheduler = BackgroundScheduler()
-scheduler.add_job(auto_market_scan, 'interval', minutes=30)
-scheduler.start()
+app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -262,6 +259,10 @@ def webhook():
 """, main_menu())
 
     return "ok", 200
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(auto_market_scan, 'interval', minutes=30)
+scheduler.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
