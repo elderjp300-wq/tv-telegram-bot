@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from flask import Flask, request
 import requests
 import os
@@ -123,31 +124,64 @@ def get_file_base64(file_id):
     img_data = requests.get(file_url).content
     return base64.b64encode(img_data).decode("utf-8")
 
+def is_trading_session():
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+    # London: 7AM-12PM UTC, NY: 12PM-5PM UTC
+    return (7 <= hour < 12) or (12 <= hour < 17)
+
 def auto_market_scan():
+    if not is_trading_session():
+        return
+
     pairs = ["EURUSD", "USDJPY", "GBPUSD"]
     for pair in pairs:
         rate = get_forex_price(pair)
         if not rate:
             continue
 
-        prompt = f"""You are a sharp SMC/ICT trading analyst.
-Current {pair} price is {rate}.
+        prompt = f"""You are an institutional SMC/ICT trading analyst. Be extremely strict.
 
-Scan for opportunity. Reply with ONLY one of:
-- "ALERT: [your short SMC reason]" if there is a valid setup forming
-- "CLEAR" if nothing significant
+Current {pair} price: {rate}
+Current UTC hour: {datetime.now(timezone.utc).hour}
 
-Be strict. Only alert if price is at a key SMC zone."""
+Analyze using this institutional framework:
+
+1. MACRO BIAS — What is the likely Daily/Weekly directional bias based on this price level? Is price in a premium or discount on the higher timeframe?
+
+2. INSTITUTIONAL ZONE — Is price currently within 0.2% of a significant institutional level? (Round numbers, previous week high/low, previous day high/low, major OB or FVG zone). If not, say CLEAR.
+
+3. SESSION CONFLUENCE — Does the current session (London or NY) align with the macro bias?
+
+4. 4H STRUCTURE — Based on the price, is there a clear 4H BOS or CHoCH suggesting institutional intent?
+
+5. VERDICT — Only say ALERT if ALL of these are true:
+   - Price is at or approaching a key institutional zone
+   - Macro bias is clear (not ranging)
+   - Session aligns with direction
+   - 4H structure confirms
+   
+   Otherwise say CLEAR.
+
+Format your response EXACTLY like this if alerting:
+ALERT: [Bias] | Zone: [level] | Reason: [one line max]
+
+Or just:
+CLEAR
+
+No extra text. Be ruthless. Most scans should return CLEAR."""
 
         result = ask_groq(prompt)
 
-        if result and "ALERT" in result.upper():
+        if result and result.strip().upper().startswith("ALERT"):
             send_telegram(CHAT_ID, f"""
-🚨 *MARKET ALERT — {pair}*
+🏦 *INSTITUTIONAL ALERT — {pair}*
 
 💰 Price: `{rate}`
 
 {result}
+
+⏰ Session: {"London 🇬🇧" if datetime.now(timezone.utc).hour < 12 else "New York 🇺🇸"}
 """)
 
 @app.route("/")
