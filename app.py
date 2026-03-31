@@ -201,17 +201,14 @@ def webhook():
 
         # Chart screenshot analysis
         if "photo" in msg:
-            send_telegram(chat_id, "📸 Chart received. Running SMC analysis...", main_menu())
+            send_telegram(chat_id, "📸 Chart received. Running SMC analysis...")
             file_id = msg["photo"][-1]["file_id"]
             try:
                 img_b64 = get_file_base64(file_id)
-                analysis = ask_claude_image(img_b64)
-                if analysis:
-                    send_telegram(chat_id, f"🧠 *SMC CHART READ*\n\n{analysis}", main_menu())
-                else:
-                    send_telegram(chat_id, "⚠️ Could not analyse chart. Try again.", main_menu())
-            except:
-                send_telegram(chat_id, "⚠️ Error reading chart. Try again.", main_menu())
+                analysis = ask_groq_image(img_b64)
+                send_telegram(chat_id, f"🧠 *SMC CHART READ*\n\n{analysis}", main_menu())
+            except Exception as e:
+                send_telegram(chat_id, f"⚠️ Error: {str(e)}", main_menu())
 
         elif "text" in msg:
             text = msg["text"]
