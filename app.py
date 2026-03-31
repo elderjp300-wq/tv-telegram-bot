@@ -80,7 +80,7 @@ def ask_groq(prompt):
 def ask_groq_image(base64_image):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
-        "Authorization": f"Bearer {os.environ.get('GROQ_API_KEY')}",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
@@ -93,7 +93,8 @@ def ask_groq_image(base64_image):
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
+                            "url": f"data:image/jpeg;base64,{base64_image}",
+                            "detail": "low"
                         }
                     },
                     {
@@ -105,10 +106,14 @@ def ask_groq_image(base64_image):
         ]
     }
     try:
-        res = requests.post(url, headers=headers, json=payload)
-        return res.json()["choices"][0]["message"]["content"]
-    except:
-        return None
+        res = requests.post(url, headers=headers, json=payload, timeout=25)
+        data = res.json()
+        if "choices" in data:
+            return data["choices"][0]["message"]["content"]
+        else:
+            return f"Model error: {data.get('error', {}).get('message', 'Unknown')}"
+    except Exception as e:
+        return f"Request failed: {str(e)}"
 
 def get_file_base64(file_id):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
