@@ -1,9 +1,13 @@
+from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request
 import requests
 import os
 import base64
 
-app = Flask(__name__)
+app = Flask(__name__):
+scheduler = BackgroundScheduler()
+scheduler.add_job(auto_market_scan, 'interval', minutes=30)
+scheduler.start()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -122,6 +126,33 @@ def get_file_base64(file_id):
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
     img_data = requests.get(file_url).content
     return base64.b64encode(img_data).decode("utf-8")
+
+def auto_market_scan():
+    pairs = ["EURUSD", "USDJPY", "GBPUSD"]
+    for pair in pairs:
+        rate = get_forex_price(pair)
+        if not rate:
+            continue
+
+        prompt = f"""You are a sharp SMC/ICT trading analyst.
+Current {pair} price is {rate}.
+
+Scan for opportunity. Reply with ONLY one of:
+- "ALERT: [your short SMC reason]" if there is a valid setup forming
+- "CLEAR" if nothing significant
+
+Be strict. Only alert if price is at a key SMC zone."""
+
+        result = ask_groq(prompt)
+
+        if result and "ALERT" in result.upper():
+            send_telegram(CHAT_ID, f"""
+🚨 *MARKET ALERT — {pair}*
+
+💰 Price: `{rate}`
+
+{result}
+""")
 
 @app.route("/")
 def home():
