@@ -8,7 +8,6 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 EXCHANGE_API_KEY = os.environ.get("EXCHANGE_API_KEY")
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 def send_telegram(chat_id, text, reply_markup=None):
@@ -159,36 +158,36 @@ def webhook():
 """, main_menu())
 
         elif action.startswith("price_"):
-            pair = action.replace("price_", "")
-            display = pair if pair != "XAUUSD" else "GOLD"
-            rate = get_forex_price(pair)
+    pair = action.replace("price_", "")
+    display = pair if pair != "XAUUSD" else "GOLD"
+    rate = get_forex_price(pair)
 
-            if rate:
-                send_telegram(chat_id, f"⏳ Got price. Running SMC read on {display}...", main_menu())
-
-                prompt = f"""You are a sharp SMC/ICT trading analyst. 
-Current {display} price is {rate}.
-
-Give me a short smart SMC-style read:
-1. Quick bias (bullish/bearish/ranging)
-2. Key zone to watch right now
-3. What to look for before entering
-4. One risk note
-
-Keep it sharp, 5 lines max. No fluff."""
-
-                analysis = ask_claude(prompt)
-
-                if analysis:
-                    send_telegram(chat_id, f"""
+    if rate:
+        # Send price immediately
+        send_telegram(chat_id, f"""
 📊 *{display}* — `{rate}`
 
-{analysis}
+🧠 Running SMC read...
 """, main_menu())
-                else:
-                    send_telegram(chat_id, f"📊 *{display}*\n\n💰 Price: `{rate}`\n\n⚠️ AI read unavailable.", main_menu())
-            else:
-                send_telegram(chat_id, "⚠️ Could not fetch price. Try again.", main_menu())
+
+        # Then run AI separately
+        prompt = f"""You are a sharp SMC/ICT trading analyst.
+Current {display} price is {rate}.
+
+Give me:
+1. Bias (bullish/bearish/ranging)
+2. Key zone to watch
+3. Entry condition
+4. One risk note
+
+5 lines max. Sharp and smart."""
+
+        analysis = ask_groq(prompt)
+
+        if analysis:
+            send_telegram(chat_id, f"🧠 *SMC READ — {display}*\n\n{analysis}", main_menu())
+    else:
+        send_telegram(chat_id, "⚠️ Could not fetch price. Try again.", main_menu())
 
     # Handle messages
     if "message" in data:
