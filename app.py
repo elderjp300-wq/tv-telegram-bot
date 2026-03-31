@@ -44,11 +44,18 @@ def answer_callback(callback_query_id):
     requests.post(url, json={"callback_query_id": callback_query_id})
 
 def get_forex_price(pair):
+    if pair == "XAUUSD":
+        try:
+            url = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
+            res = requests.get(url, timeout=10).json()
+            return round(res[0]["spreadProfilePrices"][0]["ask"], 2)
+        except:
+            return None
+
     pair_map = {
         "EURUSD": ("EUR", "USD"),
         "USDJPY": ("USD", "JPY"),
         "GBPUSD": ("GBP", "USD"),
-        "XAUUSD": ("XAU", "USD")
     }
     base, quote = pair_map[pair]
     url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_API_KEY}/pair/{base}/{quote}"
