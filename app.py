@@ -158,21 +158,21 @@ def webhook():
 """, main_menu())
 
         elif action.startswith("price_"):
-    pair = action.replace("price_", "")
-    display = pair if pair != "XAUUSD" else "GOLD"
-    rate = get_forex_price(pair)
+            pair = action.replace("price_", "")
+            display = pair if pair != "XAUUSD" else "GOLD"
+            rate = get_forex_price(pair)
 
-    if rate:
+            if rate:
         # Send price immediately
-        send_telegram(chat_id, f"""
-📊 *{display}* — `{rate}`
+                send_telegram(chat_id, f"""
+    📊 *{display}* — `{rate}`
 
-🧠 Running SMC read...
-""", main_menu())
+    🧠 Running SMC read...
+    """, main_menu())
 
-        # Then run AI separately
-        prompt = f"""You are a sharp SMC/ICT trading analyst.
-Current {display} price is {rate}.
+            # Then run AI separately
+            prompt = f"""You are a sharp SMC/ICT trading analyst.
+    Current {display} price is {rate}.
 
 Give me:
 1. Bias (bullish/bearish/ranging)
@@ -184,10 +184,10 @@ Give me:
 
         analysis = ask_groq(prompt)
 
-        if analysis:
-            send_telegram(chat_id, f"🧠 *SMC READ — {display}*\n\n{analysis}", main_menu())
-    else:
-        send_telegram(chat_id, "⚠️ Could not fetch price. Try again.", main_menu())
+            if analysis:
+                send_telegram(chat_id, f"🧠 *SMC READ — {display}*\n\n{analysis}", main_menu())
+        else:
+            send_telegram(chat_id, "⚠️ Could not fetch price. Try again.", main_menu())
 
     # Handle messages
     if "message" in data:
