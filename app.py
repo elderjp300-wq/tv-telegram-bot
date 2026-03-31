@@ -185,7 +185,7 @@ def webhook():
                 analysis = ask_groq(prompt)
 
                 if analysis:
-                send_telegram(chat_id, f"🧠 *SMC READ — {display}*\n\n{analysis}", main_menu())
+                    send_telegram(chat_id, f"🧠 *SMC READ — {display}*\n\n{analysis}", main_menu())
             else:
                 send_telegram(chat_id, "⚠️ Could not fetch price. Try again.", main_menu())
 
