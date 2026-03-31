@@ -163,31 +163,31 @@ def webhook():
             rate = get_forex_price(pair)
 
             if rate:
-        # Send price immediately
+                # Send price immediately
                 send_telegram(chat_id, f"""
-    📊 *{display}* — `{rate}`
+        📊 *{display}* — `{rate}`
 
-    🧠 Running SMC read...
-    """, main_menu())
+        🧠 Running SMC read...
+        """, main_menu())
 
-            # Then run AI separately
-            prompt = f"""You are a sharp SMC/ICT trading analyst.
-    Current {display} price is {rate}.
+                # Then run AI separately
+                prompt = f"""You are a sharp SMC/ICT trading analyst.
+        Current {display} price is {rate}.
 
-Give me:
-1. Bias (bullish/bearish/ranging)
-2. Key zone to watch
-3. Entry condition
-4. One risk note
+        Give me:
+        1. Bias (bullish/bearish/ranging)
+        2. Key zone to watch
+        3. Entry condition
+        4. One risk note
+        
+        5 lines max. Sharp and smart."""
 
-5 lines max. Sharp and smart."""
+                analysis = ask_groq(prompt)
 
-        analysis = ask_groq(prompt)
-
-            if analysis:
+                if analysis:
                 send_telegram(chat_id, f"🧠 *SMC READ — {display}*\n\n{analysis}", main_menu())
-        else:
-            send_telegram(chat_id, "⚠️ Could not fetch price. Try again.", main_menu())
+            else:
+                send_telegram(chat_id, "⚠️ Could not fetch price. Try again.", main_menu())
 
     # Handle messages
     if "message" in data:
