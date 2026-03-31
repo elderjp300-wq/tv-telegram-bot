@@ -1,4 +1,3 @@
-from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request
 import requests
 import os
@@ -153,8 +152,9 @@ Be strict. Only alert if price is at a key SMC zone."""
 
 @app.route("/")
 def home():
+    auto_market_scan()
     return "ok", 200
-
+    
 @app.route("/startup")
 def startup():
     send_telegram(CHAT_ID, "✅ JP mini bot is live and running!")
@@ -259,10 +259,6 @@ def webhook():
 """, main_menu())
 
     return "ok", 200
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(auto_market_scan, 'interval', minutes=30)
-scheduler.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
