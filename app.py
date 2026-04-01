@@ -438,6 +438,9 @@ def auto_market_scan():
             continue
 
         structure = detect_structure(candles)
+        checklist = run_checklist(structure)
+        if checklist["rating"] == "NO TRADE":
+            continue
         if not structure:
             continue
 
@@ -552,6 +555,14 @@ def webhook():
                 if structure:
                     # Build prompt with REAL data
                     prompt = build_smc_prompt(pair, structure)
+                    checklist = run_checklist(structure)
+                    checklist_msg = format_checklist_result(pair, structure, checklist)
+                    send_telegram(chat_id, checklist_msg, main_menu())
+
+                    if checklist["rating"] == "NO TRADE":
+                        continue if False else None  # skip AI call
+                    elif checklist["rating"] == "WATCHLIST":
+                        send_telegram(chat_id, f"👀 *{display}* is setting up but not ready yet. Monitor this pair.", main_menu())
                     analysis = ask_groq(prompt)
 
                     structure_summary = f"""
