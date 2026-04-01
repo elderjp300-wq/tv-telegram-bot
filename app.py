@@ -332,6 +332,96 @@ Rules:
 - If price is in Discount looking for sells, say NO TRADE
 - Maximum 5 lines. Be ruthless."""
 
+def run_checklist(structure):
+    """
+    Runs the A+ checklist against real structure data.
+    Returns a dict with score, rating, and failed conditions.
+    """
+    failed = []
+    passed = []
+
+    # 1. Trend clear?
+    if structure["trend"] == "Ranging":
+        failed.append("❌ Trend is ranging — no clear direction")
+    else:
+        passed.append("✅ Trend clear")
+
+    # 2. BOS confirmed?
+    if structure["bos"] == "None":
+        failed.append("❌ No BOS detected")
+    else:
+        passed.append("✅ BOS confirmed")
+
+    # 3. CHoCH present?
+    if structure["choch"] == "None":
+        failed.append("❌ No CHoCH detected")
+    else:
+        passed.append("✅ CHoCH present")
+
+    # 4. Correct zone?
+    zone = structure["zone"].lower()
+    trend = structure["trend"]
+    if trend == "Bullish" and "discount" not in zone:
+        failed.append("❌ Bullish bias but price not in Discount zone")
+    elif trend == "Bearish" and "premium" not in zone:
+        failed.append("❌ Bearish bias but price not in Premium zone")
+    else:
+        passed.append("✅ Price in correct zone")
+
+    # 5. Session valid?
+    if not is_trading_session():
+        failed.append("❌ Outside London/NY session")
+    else:
+        passed.append("✅ Session valid")
+
+    score = len(passed)
+
+    if score == 5:
+        rating = "A+"
+    elif score >= 3:
+        rating = "WATCHLIST"
+    else:
+        rating = "NO TRADE"
+
+    return {
+        "rating": rating,
+        "score": score,
+        "passed": passed,
+        "failed": failed
+    }
+
+
+def format_checklist_result(pair, structure, checklist):
+    """
+    Formats the checklist result into a clean Telegram message.
+    """
+    display = pair if pair != "XAUUSD" else "GOLD"
+    rating = checklist["rating"]
+
+    if rating == "A+":
+        header = f"🔥 *A+ SETUP — {display}*"
+    elif rating == "WATCHLIST":
+        header = f"👀 *WATCH THIS — {display}*"
+    else:
+        header = f"🚫 *NO TRADE — {display}*"
+
+    passed_text = "\n".join(checklist["passed"])
+    failed_text = "\n".join(checklist["failed"]) if checklist["failed"] else ""
+
+    msg = f"""{header}
+
+💰 Price: `{structure['current_price']}`
+📊 Trend: {structure['trend']}
+📍 Zone: {structure['zone']}
+⏰ Session: {get_session_label()}
+
+{passed_text}
+{failed_text}
+
+Score: {checklist['score']}/5
+"""
+    return msg
+    
 # ─────────────────────────────────────────────
 # AUTO SCAN (UPGRADED)
 # ─────────────────────────────────────────────
