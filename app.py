@@ -170,7 +170,69 @@ def detect_structure(candles):
         "zone": zone,
         "price_change_pct": round(price_change_pct, 3)
     }
+    
+def multi_timeframe_confluence(pair):
+    """
+    Fetches Daily, 4H and 1H candles and checks if all 3
+    timeframes agree on direction before allowing a signal.
+    Returns a dict with verdict and reason.
+    """
+    daily  = get_candles(pair, interval="1day", outputsize=20)
+    h4     = get_candles(pair, interval="4h",   outputsize=20)
+    h1     = get_candles(pair, interval="1h",   outputsize=20)
 
+    if not daily or not h4 or not h1:
+        return {"verdict": "NO TRADE", "reason": "Could not fetch all timeframes"}
+
+    s_daily = detect_structure(daily)
+    s_h4    = detect_structure(h4)
+    s_h1    = detect_structure(h1)
+
+    if not s_daily or not s_h4 or not s_h1:
+        return {"verdict": "NO TRADE", "reason": "Structure detection failed on one or more timeframes"}
+
+    d_trend  = s_daily["trend"]
+    h4_trend = s_h4["trend"]
+    h1_zone  = s_h1["zone"].lower()
+    h4_bos   = s_h4["bos"]
+
+    # All 3 must agree for A+
+    if d_trend == "Bullish" and h4_trend == "Bullish" and "discount" in h1_zone:
+        verdict = "A+"
+        reason  = f"Daily Bullish + 4H Bullish BOS + 1H in Discount"
+
+    elif d_trend == "Bearish" and h4_trend == "Bearish" and "premium" in h1_zone:
+        verdict = "A+"
+        reason  = f"Daily Bearish + 4H Bearish BOS + 1H in Premium"
+
+    # Daily and 4H agree but 1H not ready yet
+    elif d_trend == h4_trend and d_trend != "Ranging":
+        verdict = "WATCHLIST"
+        reason  = f"Daily + 4H both {d_trend} but 1H not at entry zone yet"
+
+    # Daily ranging — no trade
+    elif d_trend == "Ranging":
+        verdict = "NO TRADE"
+        reason  = "Daily trend is ranging — no macro bias"
+
+    # Conflict between Daily and 4H
+    elif d_trend != h4_trend and d_trend != "Ranging" and h4_trend != "Ranging":
+        verdict = "NO TRADE"
+        reason  = f"Daily {d_trend} conflicts with 4H {h4_trend}"
+
+    else:
+        verdict = "NO TRADE"
+        reason  = "No clear confluence across timeframes"
+
+    return {
+        "verdict": verdict,
+        "reason": reason,
+        "daily_trend": d_trend,
+        "h4_trend": h4_trend,
+        "h1_zone": s_h1["zone"],
+        "h4_bos": h4_bos
+    }
+    
 # ─────────────────────────────────────────────
 # GROQ AI
 # ─────────────────────────────────────────────
@@ -299,7 +361,7 @@ Rules:
 # A+ CHECKLIST ENFORCEMENT
 # ─────────────────────────────────────────────
 
-def run_checklist(structure):
+def run_checklist(structure, mtf=None):
     failed = []
     passed = []
 
@@ -332,11 +394,20 @@ def run_checklist(structure):
     else:
         passed.append("✅ Session valid")
 
+    # NEW: MTF confluence check
+    if mtf:
+        if mtf["verdict"] == "A+":
+            passed.append("✅ MTF confluence confirmed")
+        elif mtf["verdict"] == "WATCHLIST":
+            failed.append(f"❌ MTF not ready: {mtf['reason']}")
+        else:
+            failed.append(f"❌ MTF conflict: {mtf['reason']}")
+
     score = len(passed)
 
-    if score == 5:
+    if score == 6:
         rating = "A+"
-    elif score >= 3:
+    elif score >= 4:
         rating = "WATCHLIST"
     else:
         rating = "NO TRADE"
@@ -345,7 +416,8 @@ def run_checklist(structure):
         "rating": rating,
         "score": score,
         "passed": passed,
-        "failed": failed
+        "failed": failed,
+        "mtf": mtf
     }
 
 def format_checklist_result(pair, structure, checklist):
@@ -372,7 +444,7 @@ def format_checklist_result(pair, structure, checklist):
 {passed_text}
 {failed_text}
 
-Score: {checklist['score']}/5
+Score: {checklist['score']}/6
 """
 
 # ─────────────────────────────────────────────
@@ -498,7 +570,8 @@ def auto_market_scan():
         if not structure:
             continue
 
-        checklist = run_checklist(structure)
+        mtf       = multi_timeframe_confluence(pair)
+        checklist = run_checklist(structure, mtf)
         if checklist["rating"] == "NO TRADE":
             continue
 
@@ -611,7 +684,8 @@ def webhook():
             if candles:
                 structure = detect_structure(candles)
                 if structure:
-                    checklist     = run_checklist(structure)
+                    mtf           = multi_timeframe_confluence(pair)
+                    checklist     = run_checklist(structure, mtf)
                     checklist_msg = format_checklist_result(pair, structure, checklist)
                     send_telegram(chat_id, checklist_msg, main_menu())
 
