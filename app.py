@@ -10,7 +10,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 EXCHANGE_API_KEY = os.environ.get("EXCHANGE_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY")  # NEW: add this to Render env vars
+TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY")
 
 # ─────────────────────────────────────────────
 # TELEGRAM HELPERS
@@ -75,18 +75,10 @@ def get_forex_price(pair):
         return None
 
 # ─────────────────────────────────────────────
-# REAL OHLC CANDLE DATA (NEW)
+# REAL OHLC CANDLE DATA
 # ─────────────────────────────────────────────
 
-def get_candles(pair, interval="4h", outputsize=10):
-    """
-    Fetches real OHLC candle data from Twelve Data.
-    interval options: "1h", "4h", "1day"
-    outputsize = number of candles to return (max 5000 on free tier)
-    Free tier: 8 requests/minute, 800/day — more than enough for our bot.
-    Sign up free at: https://twelvedata.com
-    """
-    # Twelve Data uses slash format e.g. EUR/USD, XAU/USD
+def get_candles(pair, interval="4h", outputsize=20):
     symbol_map = {
         "EURUSD": "EUR/USD",
         "USDJPY": "USD/JPY",
@@ -109,42 +101,28 @@ def get_candles(pair, interval="4h", outputsize=10):
         if res.get("status") == "error":
             return None
         candles = res.get("values", [])
-        # Returns newest first — reverse so oldest is index 0
         candles.reverse()
         return candles
     except:
         return None
 
 # ─────────────────────────────────────────────
-# REAL SMC STRUCTURE DETECTION (NEW)
+# REAL SMC STRUCTURE DETECTION
 # ─────────────────────────────────────────────
 
 def detect_structure(candles):
-    """
-    Takes a list of OHLC candles (oldest first) and detects:
-    - Trend direction (bullish/bearish/ranging)
-    - Recent swing high and swing low
-    - BOS (Break of Structure)
-    - CHoCH (Change of Character)
-    - Whether price is in premium or discount zone
-    Returns a dict with all structure data.
-    """
     if not candles or len(candles) < 5:
         return None
 
-    # Extract highs, lows, closes as floats
     highs  = [float(c["high"])  for c in candles]
     lows   = [float(c["low"])   for c in candles]
     closes = [float(c["close"]) for c in candles]
 
     current_price = closes[-1]
+    recent_high   = max(highs[-10:])
+    recent_low    = min(lows[-10:])
 
-    # Recent swing high and low (last 10 candles)
-    recent_high = max(highs[-10:])
-    recent_low  = min(lows[-10:])
-
-    # Trend: compare last close to close 5 candles ago
-    prev_close = closes[-6] if len(closes) >= 6 else closes[0]
+    prev_close       = closes[-6] if len(closes) >= 6 else closes[0]
     price_change_pct = ((current_price - prev_close) / prev_close) * 100
 
     if price_change_pct > 0.15:
@@ -154,9 +132,6 @@ def detect_structure(candles):
     else:
         trend = "Ranging"
 
-    # BOS detection:
-    # Bullish BOS = current close breaks above the recent swing high
-    # Bearish BOS = current close breaks below the recent swing low
     mid_high = max(highs[-10:-1]) if len(highs) >= 10 else recent_high
     mid_low  = min(lows[-10:-1])  if len(lows)  >= 10 else recent_low
 
@@ -166,9 +141,6 @@ def detect_structure(candles):
     elif current_price < mid_low:
         bos = "Bearish BOS (broke below swing low)"
 
-    # CHoCH detection:
-    # If we had a bearish trend but price is now making higher lows — potential CHoCH
-    # Simplified: check if last 3 lows are rising in a bearish trend or vice versa
     choch = "None"
     if len(lows) >= 3:
         if trend == "Bearish" and lows[-1] > lows[-2] > lows[-3]:
@@ -176,9 +148,6 @@ def detect_structure(candles):
         elif trend == "Bullish" and highs[-1] < highs[-2] < highs[-3]:
             choch = "Potential Bearish CHoCH (falling highs in uptrend)"
 
-    # Premium / Discount Zone
-    # Range = recent swing high to recent swing low
-    # 0.5 = equilibrium, above = premium, below = discount
     price_range = recent_high - recent_low
     if price_range > 0:
         fib_position = (current_price - recent_low) / price_range
@@ -275,18 +244,16 @@ def get_file_base64(file_id):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
     res = requests.get(url).json()
     file_path = res["result"]["file_path"]
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    img_data = requests.get(file_url).content
+    file_url  = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    img_data  = requests.get(file_url).content
     return base64.b64encode(img_data).decode("utf-8")
 
 # ─────────────────────────────────────────────
-# SESSION FILTER
+# SESSION HELPERS
 # ─────────────────────────────────────────────
 
 def is_trading_session():
-    now = datetime.now(timezone.utc)
-    hour = now.hour
-    # London: 7AM–12PM UTC, NY: 12PM–5PM UTC
+    hour = datetime.now(timezone.utc).hour
     return (7 <= hour < 12) or (12 <= hour < 17)
 
 def get_session_label():
@@ -298,14 +265,10 @@ def get_session_label():
     return "Off-Session"
 
 # ─────────────────────────────────────────────
-# SMART SMC PROMPT BUILDER (NEW)
+# SMC PROMPT BUILDER
 # ─────────────────────────────────────────────
 
 def build_smc_prompt(pair, structure):
-    """
-    Builds a prompt using REAL structure data instead of fake guesses.
-    AI is now a refiner, not a guesser.
-    """
     return f"""You are a strict institutional SMC/ICT trading analyst.
 
 Here is REAL 4H market structure data for {pair}:
@@ -332,34 +295,30 @@ Rules:
 - If price is in Discount looking for sells, say NO TRADE
 - Maximum 5 lines. Be ruthless."""
 
+# ─────────────────────────────────────────────
+# A+ CHECKLIST ENFORCEMENT
+# ─────────────────────────────────────────────
+
 def run_checklist(structure):
-    """
-    Runs the A+ checklist against real structure data.
-    Returns a dict with score, rating, and failed conditions.
-    """
     failed = []
     passed = []
 
-    # 1. Trend clear?
     if structure["trend"] == "Ranging":
         failed.append("❌ Trend is ranging — no clear direction")
     else:
         passed.append("✅ Trend clear")
 
-    # 2. BOS confirmed?
     if structure["bos"] == "None":
         failed.append("❌ No BOS detected")
     else:
         passed.append("✅ BOS confirmed")
 
-    # 3. CHoCH present?
     if structure["choch"] == "None":
         failed.append("❌ No CHoCH detected")
     else:
         passed.append("✅ CHoCH present")
 
-    # 4. Correct zone?
-    zone = structure["zone"].lower()
+    zone  = structure["zone"].lower()
     trend = structure["trend"]
     if trend == "Bullish" and "discount" not in zone:
         failed.append("❌ Bullish bias but price not in Discount zone")
@@ -368,7 +327,6 @@ def run_checklist(structure):
     else:
         passed.append("✅ Price in correct zone")
 
-    # 5. Session valid?
     if not is_trading_session():
         failed.append("❌ Outside London/NY session")
     else:
@@ -390,13 +348,9 @@ def run_checklist(structure):
         "failed": failed
     }
 
-
 def format_checklist_result(pair, structure, checklist):
-    """
-    Formats the checklist result into a clean Telegram message.
-    """
     display = pair if pair != "XAUUSD" else "GOLD"
-    rating = checklist["rating"]
+    rating  = checklist["rating"]
 
     if rating == "A+":
         header = f"🔥 *A+ SETUP — {display}*"
@@ -408,7 +362,7 @@ def format_checklist_result(pair, structure, checklist):
     passed_text = "\n".join(checklist["passed"])
     failed_text = "\n".join(checklist["failed"]) if checklist["failed"] else ""
 
-    msg = f"""{header}
+    return f"""{header}
 
 💰 Price: `{structure['current_price']}`
 📊 Trend: {structure['trend']}
@@ -420,14 +374,13 @@ def format_checklist_result(pair, structure, checklist):
 
 Score: {checklist['score']}/5
 """
-    return msg
-    
+
+# ─────────────────────────────────────────────
+# TRADE LOGGING
+# ─────────────────────────────────────────────
+
 def log_trade_to_telegram(pair, structure, checklist):
-    """
-    Logs every A+ setup to Telegram as a trade record.
-    Acts as your permanent trade journal.
-    """
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     display = pair if pair != "XAUUSD" else "GOLD"
 
     log_msg = f"""
@@ -443,10 +396,92 @@ def log_trade_to_telegram(pair, structure, checklist):
 
 #log #{pair} #{get_session_label().split()[0]}
 """
-    send_telegram(CHAT_ID, log_msg)  
-    
+    send_telegram(CHAT_ID, log_msg)
+
 # ─────────────────────────────────────────────
-# AUTO SCAN (UPGRADED)
+# TRADE LEVELS — 3R MINIMUM
+# ─────────────────────────────────────────────
+
+def calculate_trade_levels(structure):
+    price  = structure["current_price"]
+    s_high = structure["recent_high"]
+    s_low  = structure["recent_low"]
+    trend  = structure["trend"]
+    buffer = round(price * 0.0005, 5)
+
+    if trend == "Bullish":
+        entry  = price
+        sl     = round(s_low - buffer, 5)
+        risk   = round(entry - sl, 5)
+        if risk <= 0:
+            return None
+        tp        = round(entry + (risk * 3), 5)
+        reward    = round(tp - entry, 5)
+        proximity = abs(price - s_low) / price
+        order_type = "LIMIT ORDER — price approaching discount zone" if proximity < 0.002 else "MARKET ORDER — price at zone"
+        exec_note  = "Wait for 15M CHoCH confirmation before entering"
+
+    elif trend == "Bearish":
+        entry  = price
+        sl     = round(s_high + buffer, 5)
+        risk   = round(sl - entry, 5)
+        if risk <= 0:
+            return None
+        tp        = round(entry - (risk * 3), 5)
+        reward    = round(entry - tp, 5)
+        proximity = abs(price - s_high) / price
+        order_type = "LIMIT ORDER — price approaching premium zone" if proximity < 0.002 else "MARKET ORDER — price at zone"
+        exec_note  = "Wait for 15M CHoCH confirmation before entering"
+
+    else:
+        return None
+
+    if reward <= 0:
+        return None
+
+    rr = round(reward / risk, 2)
+
+    return {
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "rr": rr,
+        "risk_pips": round(risk * 10000, 1),
+        "reward_pips": round(reward * 10000, 1),
+        "order_type": order_type,
+        "exec_note": exec_note
+    }
+
+def format_trade_signal(pair, structure, levels):
+    display = pair if pair != "XAUUSD" else "GOLD"
+    trend   = structure["trend"]
+    emoji   = "🟢 BUY" if trend == "Bullish" else "🔴 SELL"
+
+    return f"""
+⚔️ *A+ SIGNAL — {display}*
+
+{emoji}
+💰 Entry: `{levels['entry']}`
+🛡 SL: `{levels['sl']}`
+🎯 TP: `{levels['tp']}`
+📐 RR: `1:{levels['rr']}` _(min 3R enforced)_
+
+📋 Execution:
+• Type: {levels['order_type']}
+• Timeframe: 15M
+• Trigger: {levels['exec_note']}
+
+📊 Structure:
+• Trend: {structure['trend']}
+• BOS: {structure['bos']}
+• Zone: {structure['zone']}
+• Session: {get_session_label()}
+
+⚠️ _Confirm 15M CHoCH on TradingView before entry._
+"""
+
+# ─────────────────────────────────────────────
+# AUTO SCAN
 # ─────────────────────────────────────────────
 
 def auto_market_scan():
@@ -455,16 +490,16 @@ def auto_market_scan():
 
     pairs = ["EURUSD", "USDJPY", "GBPUSD", "XAUUSD"]
     for pair in pairs:
-        # Get real candle data
         candles = get_candles(pair, interval="4h", outputsize=20)
         if not candles:
             continue
 
         structure = detect_structure(candles)
+        if not structure:
+            continue
+
         checklist = run_checklist(structure)
         if checklist["rating"] == "NO TRADE":
-            continue
-        if not structure:
             continue
 
         prompt = f"""You are an institutional SMC/ICT trading analyst. Be extremely strict.
@@ -484,18 +519,22 @@ Only say ALERT if:
 - Price is at a key zone (discount for buys, premium for sells)
 - Session aligns
 
-Format EXACTLY like this if alerting:
+Format EXACTLY:
 ALERT: [Bias] | Zone: [level] | Reason: [one line max]
-
-Or just:
-CLEAR
+Or just: CLEAR
 
 No extra text. Be ruthless."""
 
         result = ask_groq(prompt)
 
         if result and result.strip().upper().startswith("ALERT"):
-            send_telegram(CHAT_ID, f"""
+            if checklist["rating"] == "A+":
+                log_trade_to_telegram(pair, structure, checklist)
+                levels = calculate_trade_levels(structure)
+                if levels:
+                    send_telegram(CHAT_ID, format_trade_signal(pair, structure, levels))
+            else:
+                send_telegram(CHAT_ID, f"""
 🏦 *INSTITUTIONAL ALERT — {pair}*
 
 💰 Price: `{structure['current_price']}`
@@ -530,7 +569,6 @@ def test_ai():
 
 @app.route("/testcandles")
 def test_candles():
-    """Test route — check if OHLC data is working"""
     candles = get_candles("EURUSD", interval="4h", outputsize=10)
     if not candles:
         return "FAILED - No candle data. Check TWELVE_DATA_KEY env var.", 500
@@ -541,11 +579,10 @@ def test_candles():
 def webhook():
     data = request.json
 
-    # Handle button taps
     if "callback_query" in data:
-        cb = data["callback_query"]
+        cb      = data["callback_query"]
         chat_id = cb["message"]["chat"]["id"]
-        action = cb["data"]
+        action  = cb["data"]
         answer_callback(cb["id"])
 
         if action == "checklist":
@@ -558,37 +595,34 @@ def webhook():
 ✅ OB tapped?
 ✅ Session valid?
 ✅ News nearby?
-✅ Price in Discount (for buys) or Premium (for sells)?
+✅ Price in Discount (buys) or Premium (sells)?
 
 ⚠️ If ANY is NO → DON'T TRADE
 """, main_menu())
 
         elif action.startswith("price_"):
-            pair = action.replace("price_", "")
+            pair    = action.replace("price_", "")
             display = pair if pair != "XAUUSD" else "GOLD"
 
-            # Send immediate response
             send_telegram(chat_id, f"📊 *{display}* — Fetching real structure data...", main_menu())
 
-            # Get real candle data
             candles = get_candles(pair, interval="4h", outputsize=20)
 
             if candles:
                 structure = detect_structure(candles)
                 if structure:
-                    # Build prompt with REAL data
-                    prompt = build_smc_prompt(pair, structure)
-                    checklist = run_checklist(structure)
+                    checklist     = run_checklist(structure)
                     checklist_msg = format_checklist_result(pair, structure, checklist)
                     send_telegram(chat_id, checklist_msg, main_menu())
 
                     if checklist["rating"] == "A+":
-                        log_trade_to_telegram(pair, structure, checklist) 
-                    if checklist["rating"] == "NO TRADE":
-                        pass
+                        log_trade_to_telegram(pair, structure, checklist)
+                        levels = calculate_trade_levels(structure)
+                        if levels:
+                            send_telegram(chat_id, format_trade_signal(pair, structure, levels), main_menu())
+
                     elif checklist["rating"] == "WATCHLIST":
                         send_telegram(chat_id, f"👀 *{display}* is setting up but not ready yet. Monitor this pair.", main_menu())
-                    analysis = ask_groq(prompt)
 
                     structure_summary = f"""
 📊 *{display}* — Real 4H Structure
@@ -604,29 +638,29 @@ def webhook():
 """
                     send_telegram(chat_id, structure_summary, main_menu())
 
+                    prompt   = build_smc_prompt(pair, structure)
+                    analysis = ask_groq(prompt)
                     if analysis:
                         send_telegram(chat_id, f"🧠 *SMC READ — {display}*\n\n{analysis}", main_menu())
+
                 else:
                     send_telegram(chat_id, "⚠️ Could not detect structure from candles.", main_menu())
             else:
-                # Fallback to spot price only
                 rate = get_forex_price(pair)
                 if rate:
-                    send_telegram(chat_id, f"⚠️ Candle data unavailable. Spot price: `{rate}`\n\n_Add TWELVE\\_DATA\\_KEY to Render env vars for full analysis._", main_menu())
+                    send_telegram(chat_id, f"⚠️ Candle data unavailable. Spot price: `{rate}`", main_menu())
                 else:
                     send_telegram(chat_id, "⚠️ Could not fetch price. Try again.", main_menu())
 
-    # Handle messages
     if "message" in data:
-        msg = data["message"]
+        msg     = data["message"]
         chat_id = msg["chat"]["id"]
 
-        # Chart screenshot analysis
         if "photo" in msg:
             send_telegram(chat_id, "📸 Chart received. Running SMC analysis...")
             file_id = msg["photo"][-1]["file_id"]
             try:
-                img_b64 = get_file_base64(file_id)
+                img_b64  = get_file_base64(file_id)
                 analysis = ask_groq_image(img_b64)
                 send_telegram(chat_id, f"🧠 *SMC CHART READ*\n\n{analysis}", main_menu())
             except Exception as e:
@@ -640,10 +674,6 @@ def webhook():
 
             elif text == "/check":
                 send_telegram(chat_id, """
-
-            elif text == "/history":
-                send_telegram(chat_id, "📓 *Your trade log is above in this chat.*\n\nSearch: #log #EURUSD #London or #NewYork to filter by pair or session.", main_menu())
-    
 🧠 *A+ CHECKLIST*
 
 ✅ 4H Trend clear?
@@ -657,7 +687,10 @@ def webhook():
 ⚠️ If ANY is NO → DON'T TRADE
 """, main_menu())
 
+            elif text == "/history":
+                send_telegram(chat_id, "📓 *Your trade log is above in this chat.*\n\nSearch: #log #EURUSD #London or #NewYork to filter by pair or session.", main_menu())
+
     return "ok", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=10000)    app.run(host="0.0.0.0", port=10000)
