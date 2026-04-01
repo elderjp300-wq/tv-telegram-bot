@@ -560,7 +560,7 @@ def webhook():
                     send_telegram(chat_id, checklist_msg, main_menu())
 
                     if checklist["rating"] == "NO TRADE":
-                        continue if False else None  # skip AI call
+                        pass
                     elif checklist["rating"] == "WATCHLIST":
                         send_telegram(chat_id, f"👀 *{display}* is setting up but not ready yet. Monitor this pair.", main_menu())
                     analysis = ask_groq(prompt)
