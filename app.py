@@ -422,6 +422,29 @@ Score: {checklist['score']}/5
 """
     return msg
     
+def log_trade_to_telegram(pair, structure, checklist):
+    """
+    Logs every A+ setup to Telegram as a trade record.
+    Acts as your permanent trade journal.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    display = pair if pair != "XAUUSD" else "GOLD"
+
+    log_msg = f"""
+📓 *TRADE LOG — {display}*
+🕐 Time: {now}
+💰 Price: `{structure['current_price']}`
+📊 Bias: {structure['trend']}
+🔍 BOS: {structure['bos']}
+⚡ CHoCH: {structure['choch']}
+📍 Zone: {structure['zone']}
+⏰ Session: {get_session_label()}
+🏆 Score: {checklist['score']}/5
+
+#log #{pair} #{get_session_label().split()[0]}
+"""
+    send_telegram(CHAT_ID, log_msg)  
+    
 # ─────────────────────────────────────────────
 # AUTO SCAN (UPGRADED)
 # ─────────────────────────────────────────────
@@ -559,6 +582,8 @@ def webhook():
                     checklist_msg = format_checklist_result(pair, structure, checklist)
                     send_telegram(chat_id, checklist_msg, main_menu())
 
+                    if checklist["rating"] == "A+":
+                        log_trade_to_telegram(pair, structure, checklist) 
                     if checklist["rating"] == "NO TRADE":
                         pass
                     elif checklist["rating"] == "WATCHLIST":
@@ -615,6 +640,10 @@ def webhook():
 
             elif text == "/check":
                 send_telegram(chat_id, """
+
+            elif text == "/history":
+                send_telegram(chat_id, "📓 *Your trade log is above in this chat.*\n\nSearch: #log #EURUSD #London or #NewYork to filter by pair or session.", main_menu())
+    
 🧠 *A+ CHECKLIST*
 
 ✅ 4H Trend clear?
