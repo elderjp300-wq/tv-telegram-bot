@@ -107,36 +107,77 @@ def get_candles(pair, interval="4h", outputsize=20):
     except:
         return None
 
+def get_swings(highs, lows, lookback=2):
+    """
+    Detects real swing highs and swing lows from OHLC data.
+    A swing high = highest point with lookback candles on each side.
+    A swing low  = lowest point with lookback candles on each side.
+    Returns lists of (index, price) tuples.
+    """
+    swing_highs = []
+    swing_lows  = []
+    for i in range(lookback, len(highs) - lookback):
+        if highs[i] == max(highs[i - lookback: i + lookback + 1]):
+            swing_highs.append((i, highs[i]))
+        if lows[i] == min(lows[i - lookback: i + lookback + 1]):
+            swing_lows.append((i, lows[i]))
+    return swing_highs, swing_lows
+
+
 def detect_structure(candles):
-    if not candles or len(candles) < 5:
+    """
+    Phase 2 — Real swing-based structure detection.
+    Uses HH/HL/LH/LL logic instead of % price change.
+    BOS and CHoCH are now based on actual structure breaks.
+    """
+    if not candles or len(candles) < 10:
         return None
+
     highs  = [float(c["high"])  for c in candles]
     lows   = [float(c["low"])   for c in candles]
     closes = [float(c["close"]) for c in candles]
+
     current_price = closes[-1]
     recent_high   = max(highs[-10:])
     recent_low    = min(lows[-10:])
-    prev_close       = closes[-6] if len(closes) >= 6 else closes[0]
-    price_change_pct = ((current_price - prev_close) / prev_close) * 100
-    if price_change_pct > 0.15:
-        trend = "Bullish"
-    elif price_change_pct < -0.15:
-        trend = "Bearish"
-    else:
+
+    swing_highs, swing_lows = get_swings(highs, lows)
+
+    # Need at least 2 swing highs and 2 swing lows for structure
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        # Fallback: not enough swings yet — mark as ranging
         trend = "Ranging"
-    mid_high = max(highs[-10:-1]) if len(highs) >= 10 else recent_high
-    mid_low  = min(lows[-10:-1])  if len(lows)  >= 10 else recent_low
-    bos = "None"
-    if current_price > mid_high:
-        bos = "Bullish BOS (broke above swing high)"
-    elif current_price < mid_low:
-        bos = "Bearish BOS (broke below swing low)"
-    choch = "None"
-    if len(lows) >= 3:
-        if trend == "Bearish" and lows[-1] > lows[-2] > lows[-3]:
-            choch = "Potential Bullish CHoCH (rising lows in downtrend)"
-        elif trend == "Bullish" and highs[-1] < highs[-2] < highs[-3]:
-            choch = "Potential Bearish CHoCH (falling highs in uptrend)"
+        bos   = "None"
+        choch = "None"
+    else:
+        last_high = swing_highs[-1][1]
+        prev_high = swing_highs[-2][1]
+        last_low  = swing_lows[-1][1]
+        prev_low  = swing_lows[-2][1]
+
+        # REAL TREND: HH+HL = Bullish, LH+LL = Bearish, else Ranging
+        if last_high > prev_high and last_low > prev_low:
+            trend = "Bullish"
+        elif last_high < prev_high and last_low < prev_low:
+            trend = "Bearish"
+        else:
+            trend = "Ranging"
+
+        # REAL BOS: price breaks the previous structural high/low
+        bos = "None"
+        if trend == "Bullish" and current_price > prev_high:
+            bos = "Bullish BOS (broke above prev swing high)"
+        elif trend == "Bearish" and current_price < prev_low:
+            bos = "Bearish BOS (broke below prev swing low)"
+
+        # REAL CHoCH: price breaks AGAINST the trend — first sign of reversal
+        choch = "None"
+        if trend == "Bearish" and current_price > prev_high:
+            choch = "Bullish CHoCH (bearish trend broken to upside)"
+        elif trend == "Bullish" and current_price < prev_low:
+            choch = "Bearish CHoCH (bullish trend broken to downside)"
+
+    # Fib zone (Premium / Discount / Equilibrium)
     price_range = recent_high - recent_low
     if price_range > 0:
         fib_position = (current_price - recent_low) / price_range
@@ -148,6 +189,7 @@ def detect_structure(candles):
             zone = f"Equilibrium ({round(fib_position * 100, 1)}% of range)"
     else:
         zone = "Ranging (no clear range)"
+
     return {
         "trend": trend,
         "current_price": round(current_price, 5),
@@ -155,9 +197,32 @@ def detect_structure(candles):
         "recent_low": round(recent_low, 5),
         "bos": bos,
         "choch": choch,
-        "zone": zone,
-        "price_change_pct": round(price_change_pct, 3)
+        "zone": zone
     }
+
+
+def confirm_entry_15m(pair):
+    """
+    Phase 2 — Checks 15M candles for a real CHoCH confirmation.
+    This is the LTF entry trigger — bot checks it automatically
+    instead of just telling you to check manually.
+    Returns (confirmed: bool, reason: str)
+    """
+    candles = get_candles(pair, interval="15min", outputsize=30)
+    if not candles:
+        return False, "No 15M data available"
+
+    structure = detect_structure(candles)
+    if not structure:
+        return False, "15M structure unclear — not enough swings"
+
+    if structure["choch"] != "None":
+        return True, f"15M CHoCH confirmed: {structure['choch']}"
+
+    if structure["bos"] != "None":
+        return True, f"15M BOS confirmed: {structure['bos']}"
+
+    return False, "No 15M CHoCH or BOS yet — wait for LTF trigger"
 
 def multi_timeframe_confluence(pair):
     daily = get_candles(pair, interval="1day", outputsize=20)
@@ -602,9 +667,21 @@ _Every A+ signal is auto-logged._
                     send_telegram(chat_id, checklist_msg, main_menu())
                     if checklist["rating"] == "A+":
                         log_trade_to_telegram(pair, structure, checklist)
-                        levels = calculate_trade_levels(structure)
-                        if levels:
-                            send_telegram(chat_id, format_trade_signal(pair, structure, levels), main_menu())
+                        confirmed, ltf_reason = confirm_entry_15m(pair)
+                        if confirmed:
+                            levels = calculate_trade_levels(structure)
+                            if levels:
+                                send_telegram(chat_id, format_trade_signal(pair, structure, levels), main_menu())
+                        else:
+                            send_telegram(chat_id, f"""
+⏳ *A+ SETUP — WAITING FOR ENTRY*
+
+*{display}* structure is ready but 15M not confirmed yet.
+
+🔍 LTF Status: {ltf_reason}
+
+_Wait for 15M CHoCH on TradingView, then re-tap the pair._
+""", main_menu())
                     elif checklist["rating"] == "WATCHLIST":
                         send_telegram(chat_id, f"👀 *{display}* setting up but not ready. Monitor for 1H entry zone.", main_menu())
                     structure_summary = f"""
