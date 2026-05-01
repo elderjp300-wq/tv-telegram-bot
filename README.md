@@ -1,29 +1,23 @@
-# JP Gold Bot — v2.0 (Session 1: Foundation)
+# JP Gold Bot — v2.0 (Sessions 1+2+3)
 
 Production-grade Telegram trading assistant for gold (XAU/USD).
-Built around a 2H structure + 15M trigger SMC strategy.
+Real strategy logic with Order Blocks, FVGs, zone tracking, DXY confluence,
+and proactive alerts.
 
-## What's In This Session
+## What This Bot Does (End-to-End)
 
-This is **Session 1 of 4** in the bot rebuild.
-
-**Included:**
-- Gold-only analysis (no other pairs)
-- Hard session gating (London 7-12 UTC, NY 12-17 UTC, weekends off)
-- 1H → 2H pandas resampling (Twelve Data doesn't natively serve 2H)
-- ATR(14) calculation
-- Consolidation detector (skips choppy markets)
-- Improved swing detection (lookback=5 + ATR significance filter)
-- Clean back-button UX (no menu-stuffing under every message)
-- Heartbeat indicator on the dashboard
-- DXY hook stubbed (live wiring in Session 3)
-
-**NOT yet included (coming Sessions 2-4):**
-- Order Block detection
-- FVG/Imbalance detection
-- Zone storage + valid/poor workflow
-- Live DXY confluence
-- Proactive alerts (zone approach, BOS firing, session opens)
+1. **Watches gold 2H** during London/NY sessions
+2. **Detects fresh 2H BOS** automatically
+3. **Marks the Order Block** (last opposing candle before impulse, any color)
+4. **Marks the FVG** in the impulse leg if present
+5. **Sends zone to you** with Valid/Poor/Edit buttons
+6. **You confirm valid** → bot saves zone in memory + permanent Telegram log
+7. **Bot watches proximity:** Approaching → Near → Tapped → alerts you each state
+8. **Bot watches 15M** for BOS/CHoCH alignment with the zone
+9. **Signal fires** when 15M trigger hits inside zone with entry/SL/TP at 3R
+10. **DXY confluence** check (must move opposite to your trade)
+11. **Auto-invalidation** when zone fails or signal completes
+12. **Anti-spam:** each alert state fires only once per zone
 
 ## Environment Variables (Render Dashboard)
 
@@ -31,7 +25,7 @@ This is **Session 1 of 4** in the bot rebuild.
 BOT_TOKEN          — Telegram bot token from @BotFather
 CHAT_ID            — Your Telegram chat ID (from @userinfobot)
 TWELVE_DATA_KEY    — From twelvedata.com (free tier OK)
-GROQ_API_KEY       — From console.groq.com (stubbed in S1, needed S3)
+GROQ_API_KEY       — Optional, for AI chat features
 ```
 
 ## Render Setup
@@ -42,7 +36,7 @@ GROQ_API_KEY       — From console.groq.com (stubbed in S1, needed S3)
 
 ## Telegram Setup
 
-Set the webhook URL (run once):
+Set the webhook URL (one time):
 ```
 https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<RENDER_URL>/webhook
 ```
@@ -51,29 +45,59 @@ https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<RENDER_URL>/webh
 
 Monitor URL: `https://<RENDER_URL>/`
 Interval: 5 minutes
-This both keeps Render warm AND triggers `auto_market_scan()`.
+This both keeps Render warm AND triggers `auto_market_scan()` proactively.
 
-## Manual Testing
+## Manual Commands
 
-- `/menu` — show dashboard
+- `/menu` or `/start` — show dashboard
 - `/scan` — force gold analysis
+- `/zones` — list active zones
 - `/health` — bot status
 - `/rules` — entry rules
 - `/checklist` — A+ checklist
 
-## What To Validate Before Session 2
+## How To Use The Zone Workflow
 
-1. ☐ Dashboard loads cleanly with single back-button UX
-2. ☐ Force Scan returns 2H structure card with current gold price
-3. ☐ Trend / BOS / CHoCH show correct values vs your TradingView read
-4. ☐ Heartbeat updates after each scan
-5. ☐ Off-session attempts return "Market Closed" (test on weekend or after 17:00 UTC)
-6. ☐ Consolidation detector triggers on chop (visually verify on chart)
-7. ☐ Swings look clean — no over-detection of micro-wiggles
+When the bot detects a fresh 2H BOS, it sends you a zone proposal:
+
+```
+🔔 NEW ZONE DETECTED — GOLD
+Direction: ▲ BULLISH
+OB:        4598 – 4612
+FVG:       4615 – 4620
+Total zone: 4598 – 4620
+2H BOS at:  4598
+
+[✓ Valid] [✗ Poor]
+[✏️ Edit]
+[Back to Dashboard]
+```
+
+- **Valid:** bot saves zone, watches it, alerts you on approach/trigger
+- **Poor:** zone discarded
+- **Edit:** bot prompts for corrected zone — reply with `high, low` (e.g., `4605, 4598`)
+
+## Active Zones Behavior
+
+- Up to **2 active zones** at a time (oldest replaced if more come)
+- Zones auto-invalidate when price closes beyond them in wrong direction
+- Zone is removed when signal fires (one-shot use)
+
+## Validate Before Session 4
+
+After a few days of running, watch for:
+
+1. ☐ Bot detects 2H BOS that match what you see on TradingView
+2. ☐ Order Blocks marked correctly (last opposing candle before impulse)
+3. ☐ FVGs correctly identified when they exist
+4. ☐ Proximity alerts fire when expected (Approaching/Near/Tapped)
+5. ☐ Signals fire only when 15M trigger aligns
+6. ☐ TP is exactly 3R from entry
+7. ☐ DXY confluence shows correctly
+8. ☐ No spam (each alert fires once per zone)
 
 ## Versioning
 
-- v2.0-session1 — Foundation (this file)
-- v2.0-session2 — OB + FVG + Zone workflow (next)
-- v2.0-session3 — DXY + Proactive alerts
-- v2.0-session4 — Polish + stress test
+- v2.0-session1 — Foundation (deployed)
+- v2.0-s1s2s3 — **Current: OB + FVG + Zones + DXY + Proactive Alerts**
+- v2.0-session4 — Polish + stress test (next session)
