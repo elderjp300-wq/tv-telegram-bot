@@ -1,29 +1,20 @@
 """
 ═══════════════════════════════════════════════════════════════════════
-  JP GOLD BOT — v2.0 (Session 1: Foundation)
+  JP GOLD BOT — v2.0 (Session 1: Foundation — Lightweight Build)
 ═══════════════════════════════════════════════════════════════════════
   Built for: Johnpaul Uche
   Strategy:  Gold-only, 2H structure + 15M trigger, SMC/ICT
-  Stack:     Flask + Telegram + Twelve Data + Groq (stubbed) + Render
-  
-  Session 1 Scope:
-    - Strip all non-gold pairs and Fibonacci logic
-    - Rewire menu: Gold | Force Scan | Trade Log | Rules | Checklist | Session
-    - Add 1H -> 2H resampling (pandas)
-    - Add ATR + consolidation detector
-    - Improve swing detection (lookback=5, ATR significance filter)
-    - Hard session gating (no exceptions)
-    - Heartbeat indicator
-    - Clean back-button UX (no menu-stuffing)
-    - Stub DXY hook for Session 3
+  Stack:     Flask + Telegram + Twelve Data (no pandas/numpy)
+
+  Why no pandas? Render free tier struggles with heavy installs.
+  Pandas was only needed for 1H -> 2H resampling, which is a small
+  loop in pure Python. This version deploys in 30s and runs leaner.
 ═══════════════════════════════════════════════════════════════════════
 """
 
 import os
 import requests
-import pandas as pd
-import numpy as np
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from flask import Flask, request
 
 # ─────────────────────────────────────────────────────────────
@@ -37,20 +28,17 @@ TWELVE_DATA_KEY  = os.environ.get("TWELVE_DATA_KEY")
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY")  # stubbed in Session 1
 
 # Strategy parameters (centralized for easy tuning)
-SWING_LOOKBACK       = 5         # bars on each side for swing detection
-ATR_PERIOD           = 14        # ATR window
-ATR_SIGNIFICANCE     = 0.5       # swing must clear 0.5 * ATR to count
-CONSOLIDATION_RATIO  = 1.5       # range must exceed 1.5 * ATR to trade
-MIN_RR               = 3.0       # minimum risk-reward
-RISK_PERCENT         = 0.5       # per trade
-APPROACH_ATR         = 1.5       # within 1.5 * ATR = approaching zone
-NEAR_ATR             = 0.5       # within 0.5 * ATR = near zone
+SWING_LOOKBACK       = 5
+ATR_PERIOD           = 14
+ATR_SIGNIFICANCE     = 0.5
+CONSOLIDATION_RATIO  = 1.5
+MIN_RR               = 3.0
+RISK_PERCENT         = 0.5
 
 # Session windows (UTC)
 LONDON_OPEN, LONDON_CLOSE = 7, 12
 NY_OPEN, NY_CLOSE         = 12, 17
 
-# Last scan tracker (for heartbeat)
 LAST_SCAN_TIME = None
 
 
@@ -58,7 +46,6 @@ LAST_SCAN_TIME = None
 # TELEGRAM HELPERS
 # ─────────────────────────────────────────────────────────────
 def send_telegram(chat_id, text, reply_markup=None):
-    """Send a Telegram message, optionally with inline buttons."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
@@ -66,11 +53,10 @@ def send_telegram(chat_id, text, reply_markup=None):
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception:
-        pass  # silent fail; logging can be added later
+        pass
 
 
 def answer_callback(callback_query_id):
-    """Acknowledge an inline button press to stop the loading spinner."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
     try:
         requests.post(url, json={"callback_query_id": callback_query_id}, timeout=5)
@@ -86,9 +72,8 @@ def now_utc():
 
 
 def is_session_active():
-    """Return True only during London or NY sessions (weekdays)."""
     n = now_utc()
-    if n.weekday() >= 5:  # 5=Sat, 6=Sun -> markets closed
+    if n.weekday() >= 5:
         return False
     h = n.hour
     return (LONDON_OPEN <= h < LONDON_CLOSE) or (NY_OPEN <= h < NY_CLOSE)
@@ -109,7 +94,6 @@ def get_session_label():
 def get_next_session():
     n = now_utc()
     h = n.hour
-
     if n.weekday() >= 5:
         return "Markets reopen Monday"
     if h < LONDON_OPEN:
@@ -119,13 +103,11 @@ def get_next_session():
     elif h < NY_CLOSE:
         return "New York active"
     else:
-        # after NY close
         hours_to_london = (24 - h) + LONDON_OPEN
         return f"London opens in {hours_to_london}h"
 
 
 def heartbeat_line():
-    """Tiny status line shown on the dashboard."""
     if LAST_SCAN_TIME:
         last = LAST_SCAN_TIME.strftime("%H:%M UTC")
         return f"☑ Online  ▪︎  Last scan: `{last}`"
@@ -136,7 +118,7 @@ def heartbeat_line():
 # DATA LAYER — Twelve Data
 # ─────────────────────────────────────────────────────────────
 def fetch_candles(symbol, interval, outputsize):
-    """Fetch raw candles from Twelve Data. Returns list of dicts or None."""
+    """Fetch raw candles. Returns list of dicts (oldest first) with float OHLC."""
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
@@ -150,123 +132,136 @@ def fetch_candles(symbol, interval, outputsize):
         if res.get("status") == "error":
             return None
         candles = res.get("values", [])
-        candles.reverse()  # oldest first
-        return candles
+        if not candles:
+            return None
+        clean = []
+        for c in candles:
+            try:
+                clean.append({
+                    "datetime": c["datetime"],
+                    "open":     float(c["open"]),
+                    "high":     float(c["high"]),
+                    "low":      float(c["low"]),
+                    "close":    float(c["close"]),
+                })
+            except (KeyError, ValueError):
+                continue
+        clean.reverse()
+        return clean
     except Exception:
         return None
 
 
-def candles_to_df(candles):
-    """Convert raw Twelve Data candles to a clean OHLC DataFrame."""
-    if not candles:
+def resample_1h_to_2h(candles_1h):
+    """
+    Pure-Python resampling: groups 1H candles into 2H buckets.
+    open=first, high=max, low=min, close=last per 2H bucket.
+    """
+    if not candles_1h:
         return None
-    df = pd.DataFrame(candles)
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.set_index("datetime")
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "volume" in df.columns:
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-    df = df.dropna(subset=["open", "high", "low", "close"])
-    return df
+
+    buckets = {}
+    for c in candles_1h:
+        dt = datetime.fromisoformat(c["datetime"].replace(" ", "T"))
+        bucket_hour = (dt.hour // 2) * 2
+        bucket_key = dt.replace(hour=bucket_hour, minute=0, second=0, microsecond=0)
+
+        if bucket_key not in buckets:
+            buckets[bucket_key] = {
+                "datetime": bucket_key.isoformat(),
+                "open":  c["open"],
+                "high":  c["high"],
+                "low":   c["low"],
+                "close": c["close"],
+            }
+        else:
+            b = buckets[bucket_key]
+            b["high"]  = max(b["high"], c["high"])
+            b["low"]   = min(b["low"],  c["low"])
+            b["close"] = c["close"]
+
+    sorted_keys = sorted(buckets.keys())
+    return [buckets[k] for k in sorted_keys]
 
 
 def get_2h_data(bars=30):
-    """
-    Pull 1H gold candles, resample to 2H locally.
-    Twelve Data doesn't natively support 2H. We fetch bars*2 hours of 1H,
-    then resample using pandas. Returns DataFrame with 2H OHLC.
-    """
-    needed_1h = bars * 2 + 4  # buffer
+    needed_1h = bars * 2 + 4
     candles_1h = fetch_candles("XAU/USD", "1h", needed_1h)
-    df_1h = candles_to_df(candles_1h)
-    if df_1h is None or len(df_1h) < 10:
+    if not candles_1h or len(candles_1h) < 10:
         return None
-
-    ohlc_rules = {
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-    }
-    df_2h = df_1h.resample("2h").agg(ohlc_rules).dropna()
-    return df_2h.tail(bars).copy()
+    candles_2h = resample_1h_to_2h(candles_1h)
+    if not candles_2h or len(candles_2h) < 10:
+        return None
+    return candles_2h[-bars:]
 
 
 def get_15m_data(bars=30):
-    """Pull 15M gold candles directly."""
-    candles = fetch_candles("XAU/USD", "15min", bars)
-    df = candles_to_df(candles)
-    if df is None or len(df) < 10:
-        return None
-    return df
+    return fetch_candles("XAU/USD", "15min", bars)
 
 
 def get_dxy_summary():
-    """
-    STUB for Session 3.
-    Returns one of: 'BULLISH', 'BEARISH', 'NEUTRAL', 'UNAVAILABLE'.
-    For Session 1, returns NEUTRAL as a placeholder.
-    """
+    """Stubbed for Session 1. Live DXY wired in Session 3."""
     return "NEUTRAL"
 
 
 # ─────────────────────────────────────────────────────────────
-# INDICATOR LAYER
+# INDICATOR LAYER (pure Python)
 # ─────────────────────────────────────────────────────────────
-def add_atr(df, period=ATR_PERIOD):
-    """Add ATR column to a DataFrame."""
-    df = df.copy()
-    df["tr1"] = df["high"] - df["low"]
-    df["tr2"] = (df["high"] - df["close"].shift(1)).abs()
-    df["tr3"] = (df["low"] - df["close"].shift(1)).abs()
-    df["true_range"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
-    df["atr"] = df["true_range"].rolling(window=period).mean()
-    return df
+def compute_atr(candles, period=ATR_PERIOD):
+    """Returns list of ATR values aligned with candles. Early values = None."""
+    if not candles or len(candles) < period + 1:
+        return [None] * len(candles) if candles else []
+
+    tr_list = [None]
+    for i in range(1, len(candles)):
+        h = candles[i]["high"]
+        l = candles[i]["low"]
+        prev_close = candles[i - 1]["close"]
+        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        tr_list.append(tr)
+
+    atr_list = [None] * len(candles)
+    for i in range(period, len(candles)):
+        window = tr_list[i - period + 1:i + 1]
+        if all(x is not None for x in window):
+            atr_list[i] = sum(window) / period
+    return atr_list
 
 
-def detect_swings(df, lookback=SWING_LOOKBACK):
-    """
-    Detect swings using centered rolling window AND ATR significance filter.
-    A swing is only valid if it clears 0.5 * ATR from the surrounding price.
-    Returns the DataFrame with swing_high and swing_low boolean columns.
-    """
-    df = df.copy()
-    window = 2 * lookback + 1
+def detect_swings(candles, atr_list, lookback=SWING_LOOKBACK):
+    """Returns (swing_highs, swing_lows) as lists of (index, price) tuples."""
+    swing_highs = []
+    swing_lows = []
+    n = len(candles)
 
-    df["rolling_high"] = df["high"].rolling(window=window, center=True).max()
-    df["rolling_low"]  = df["low"].rolling(window=window, center=True).min()
+    for i in range(lookback, n - lookback):
+        window_high = [candles[j]["high"] for j in range(i - lookback, i + lookback + 1)]
+        window_low  = [candles[j]["low"]  for j in range(i - lookback, i + lookback + 1)]
+        local_avg_close = sum(c["close"] for c in candles[i - lookback:i + lookback + 1]) / (2 * lookback + 1)
 
-    raw_swing_high = df["high"] == df["rolling_high"]
-    raw_swing_low  = df["low"]  == df["rolling_low"]
+        atr_here = atr_list[i] if atr_list[i] is not None else None
 
-    # ATR significance filter — swing must clear meaningful distance
-    # from local average to count
-    if "atr" in df.columns:
-        # local context = rolling mean of close over the window
-        local_mean = df["close"].rolling(window=window, center=True).mean()
-        threshold = df["atr"] * ATR_SIGNIFICANCE
+        if candles[i]["high"] == max(window_high):
+            if atr_here is None or abs(candles[i]["high"] - local_avg_close) >= ATR_SIGNIFICANCE * atr_here:
+                swing_highs.append((i, candles[i]["high"]))
 
-        df["swing_high"] = raw_swing_high & ((df["high"] - local_mean).abs() >= threshold)
-        df["swing_low"]  = raw_swing_low  & ((df["low"]  - local_mean).abs() >= threshold)
-    else:
-        df["swing_high"] = raw_swing_high
-        df["swing_low"]  = raw_swing_low
+        if candles[i]["low"] == min(window_low):
+            if atr_here is None or abs(candles[i]["low"] - local_avg_close) >= ATR_SIGNIFICANCE * atr_here:
+                swing_lows.append((i, candles[i]["low"]))
 
-    return df
+    return swing_highs, swing_lows
 
 
-def is_consolidating(df):
-    """
-    Returns True if last 10 bars are in tight range (<1.5 * ATR).
-    Used to skip choppy markets.
-    """
-    if len(df) < 10 or "atr" not in df.columns:
+def is_consolidating(candles, atr_list):
+    if len(candles) < 10:
         return False
-    recent = df.tail(10)
-    range_size = recent["high"].max() - recent["low"].min()
-    avg_atr = recent["atr"].mean()
-    if pd.isna(avg_atr) or avg_atr == 0:
+    recent = candles[-10:]
+    range_size = max(c["high"] for c in recent) - min(c["low"] for c in recent)
+    recent_atrs = [a for a in atr_list[-10:] if a is not None]
+    if not recent_atrs:
+        return False
+    avg_atr = sum(recent_atrs) / len(recent_atrs)
+    if avg_atr == 0:
         return False
     return range_size < (CONSOLIDATION_RATIO * avg_atr)
 
@@ -274,27 +269,17 @@ def is_consolidating(df):
 # ─────────────────────────────────────────────────────────────
 # STRUCTURE DETECTION
 # ─────────────────────────────────────────────────────────────
-def analyze_structure(df):
-    """
-    Full structural analysis on a 2H DataFrame.
-    Returns a dict with: trend, current_price, recent_high, recent_low,
-    bos, choch, last_swing_high, last_swing_low, consolidating, atr.
-    """
-    if df is None or len(df) < 15:
+def analyze_structure(candles):
+    if not candles or len(candles) < 15:
         return None
 
-    df = add_atr(df)
-    df = detect_swings(df)
+    atr_list = compute_atr(candles)
+    swing_highs, swing_lows = detect_swings(candles, atr_list)
+    consolidating = is_consolidating(candles, atr_list)
 
-    consolidating = is_consolidating(df)
+    current_price = candles[-1]["close"]
+    atr_now = atr_list[-1]
 
-    swings_h = df[df["swing_high"]]["high"].dropna()
-    swings_l = df[df["swing_low"]]["low"].dropna()
-
-    current_price = float(df["close"].iloc[-1])
-    atr_now = float(df["atr"].iloc[-1]) if not pd.isna(df["atr"].iloc[-1]) else None
-
-    # Default values
     trend = "Ranging"
     bos = "None"
     choch = "None"
@@ -303,34 +288,33 @@ def analyze_structure(df):
     prev_high_val = None
     prev_low_val = None
 
-    if len(swings_h) >= 2 and len(swings_l) >= 2:
-        last_high_val = float(swings_h.iloc[-1])
-        prev_high_val = float(swings_h.iloc[-2])
-        last_low_val  = float(swings_l.iloc[-1])
-        prev_low_val  = float(swings_l.iloc[-2])
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        last_high_val = swing_highs[-1][1]
+        prev_high_val = swing_highs[-2][1]
+        last_low_val  = swing_lows[-1][1]
+        prev_low_val  = swing_lows[-2][1]
 
         if last_high_val > prev_high_val and last_low_val > prev_low_val:
             trend = "Bullish"
         elif last_high_val < prev_high_val and last_low_val < prev_low_val:
             trend = "Bearish"
 
-        # BOS: price has broken the prior structural reference
         if trend == "Bullish" and current_price > prev_high_val:
             bos = f"Bullish BOS @ `{round(prev_high_val, 2)}`"
         elif trend == "Bearish" and current_price < prev_low_val:
             bos = f"Bearish BOS @ `{round(prev_low_val, 2)}`"
 
-        # CHoCH: counter-trend break = first reversal sign
         if trend == "Bearish" and current_price > prev_high_val:
             choch = f"Bullish CHoCH @ `{round(prev_high_val, 2)}`"
         elif trend == "Bullish" and current_price < prev_low_val:
             choch = f"Bearish CHoCH @ `{round(prev_low_val, 2)}`"
 
+    recent_window = candles[-20:] if len(candles) >= 20 else candles
     return {
         "trend":           trend,
         "current_price":   round(current_price, 2),
-        "recent_high":     round(float(df["high"].tail(20).max()), 2),
-        "recent_low":      round(float(df["low"].tail(20).min()), 2),
+        "recent_high":     round(max(c["high"] for c in recent_window), 2),
+        "recent_low":      round(min(c["low"]  for c in recent_window), 2),
         "bos":             bos,
         "choch":           choch,
         "last_swing_high": round(last_high_val, 2) if last_high_val else None,
@@ -341,18 +325,16 @@ def analyze_structure(df):
 
 
 # ─────────────────────────────────────────────────────────────
-# DISPLAY MESSAGES (clean, professional formatting)
+# DISPLAY MESSAGES
 # ─────────────────────────────────────────────────────────────
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 
 def back_button():
-    """Single back-to-dashboard button. No menu stuffing."""
     return {"inline_keyboard": [[{"text": "▪︎ Back to Dashboard", "callback_data": "dashboard"}]]}
 
 
 def main_menu():
-    """The full menu — only attached to the dashboard message."""
     return {
         "inline_keyboard": [
             [{"text": "🪙  Gold — Deep Analysis", "callback_data": "analyze_gold"}],
@@ -480,12 +462,10 @@ _Every signal and zone is auto-logged._
 
 
 def format_structure_card(structure):
-    """Format the 2H structure analysis as a clean card."""
     trend_icon = {"Bullish": "▲", "Bearish": "▼", "Ranging": "◆"}.get(structure["trend"], "◆")
-
     consolidation_note = ""
     if structure["consolidating"]:
-        consolidation_note = f"\n⚠  *Consolidating range* — wait for breakout"
+        consolidation_note = "\n⚠  *Consolidating range* — wait for breakout"
 
     swing_h = structure["last_swing_high"]
     swing_l = structure["last_swing_low"]
@@ -511,27 +491,22 @@ Session:    {get_session_label()}{consolidation_note}
 # CORE ANALYSIS FLOW
 # ─────────────────────────────────────────────────────────────
 def run_gold_analysis():
-    """
-    Main analysis pipeline. Returns (success, message_dict).
-    Used both by manual buttons and auto-scan.
-    """
     global LAST_SCAN_TIME
 
-    # Hard session gate — no analysis when market is closed
     if not is_session_active():
         return False, {
             "headline": "◯  *Market Closed*",
             "body": f"Gold analysis only runs during London or NY sessions.\n\n_{get_next_session()}_",
         }
 
-    df_2h = get_2h_data(bars=30)
-    if df_2h is None:
+    candles_2h = get_2h_data(bars=30)
+    if not candles_2h:
         return False, {
             "headline": "⚠  *Data Unavailable*",
             "body": "Could not fetch gold 2H data from provider.\nTry Force Scan again in a moment.",
         }
 
-    structure = analyze_structure(df_2h)
+    structure = analyze_structure(candles_2h)
     if structure is None:
         return False, {
             "headline": "⚠  *Structure Analysis Failed*",
@@ -540,33 +515,20 @@ def run_gold_analysis():
 
     LAST_SCAN_TIME = now_utc()
     card = format_structure_card(structure)
-
-    # In Session 1 we just return the structure card.
-    # Session 2 will add OB/FVG marking and zone workflow on top.
     return True, {"headline": None, "body": card, "structure": structure}
 
 
-# ─────────────────────────────────────────────────────────────
-# AUTO-SCAN (triggered by UptimeRobot pings)
-# ─────────────────────────────────────────────────────────────
 def auto_market_scan():
-    """
-    Lightweight scan that runs every UptimeRobot ping (~5 min).
-    For Session 1: just refreshes scan time and silently checks structure.
-    Session 2 will add proactive zone-state alerts.
-    """
     global LAST_SCAN_TIME
     if not is_session_active():
-        return  # silent during off-hours
-
-    df_2h = get_2h_data(bars=30)
-    if df_2h is None:
         return
-    structure = analyze_structure(df_2h)
+    candles_2h = get_2h_data(bars=30)
+    if not candles_2h:
+        return
+    structure = analyze_structure(candles_2h)
     if structure is None:
         return
     LAST_SCAN_TIME = now_utc()
-    # Future: trigger proactive alerts here (Session 2/3)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -574,26 +536,23 @@ def auto_market_scan():
 # ─────────────────────────────────────────────────────────────
 @app.route("/")
 def root():
-    """UptimeRobot pings here every 5 min."""
     auto_market_scan()
     return "ok", 200
 
 
 @app.route("/health")
 def health():
-    """Manual health check."""
     return {
         "status": "online",
         "session_active": is_session_active(),
         "session": get_session_label(),
         "last_scan": LAST_SCAN_TIME.isoformat() if LAST_SCAN_TIME else None,
-        "version": "2.0-session1",
+        "version": "2.0-session1-lite",
     }, 200
 
 
 @app.route("/startup")
 def startup():
-    """Send the dashboard manually (for testing)."""
     if CHAT_ID:
         send_telegram(CHAT_ID, dashboard_message(), main_menu())
     return "ok", 200
@@ -601,12 +560,10 @@ def startup():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Main Telegram webhook handler."""
     data = request.json
     if not data:
         return "ok", 200
 
-    # ─── Inline button presses ──────────────────────────────
     if "callback_query" in data:
         cb = data["callback_query"]
         chat_id = cb["message"]["chat"]["id"]
@@ -615,20 +572,15 @@ def webhook():
 
         if action == "dashboard":
             send_telegram(chat_id, dashboard_message(), main_menu())
-
         elif action == "session_info":
             send_telegram(chat_id, session_status_message(), back_button())
-
         elif action == "rules":
             send_telegram(chat_id, rules_message(), back_button())
-
         elif action == "checklist":
             send_telegram(chat_id, checklist_message(), back_button())
-
         elif action == "trade_log":
             send_telegram(chat_id, trade_log_message(), back_button())
-
-        elif action == "analyze_gold" or action == "force_scan":
+        elif action in ("analyze_gold", "force_scan"):
             label = "*Analyzing gold...*" if action == "analyze_gold" else "*Force scanning gold...*"
             send_telegram(chat_id, label)
             ok, result = run_gold_analysis()
@@ -638,7 +590,6 @@ def webhook():
                 msg = f"{result['headline']}\n{DIVIDER}\n{result['body']}"
                 send_telegram(chat_id, msg, back_button())
 
-    # ─── Text/photo messages ────────────────────────────────
     if "message" in data:
         msg = data["message"]
         chat_id = msg["chat"]["id"]
@@ -656,7 +607,7 @@ def webhook():
         elif text == "/health":
             send_telegram(
                 chat_id,
-                f"☑ *Bot Health*\n{DIVIDER}\nVersion: `2.0-session1`\nSession: {get_session_label()}\n{heartbeat_line()}",
+                f"☑ *Bot Health*\n{DIVIDER}\nVersion: `2.0-session1-lite`\nSession: {get_session_label()}\n{heartbeat_line()}",
                 back_button(),
             )
         elif text == "/rules":
@@ -664,7 +615,6 @@ def webhook():
         elif text == "/checklist":
             send_telegram(chat_id, checklist_message(), back_button())
         else:
-            # Unknown text — just direct to dashboard
             send_telegram(chat_id, "_Tap a button on the dashboard, or use_ `/menu`", back_button())
 
     return "ok", 200
