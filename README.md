@@ -1,23 +1,26 @@
-# JP Gold Bot — v2.0 (Sessions 1+2+3)
+# JP Gold Bot — v2.0 (Final / Sessions 1+2+3+4)
 
 Production-grade Telegram trading assistant for gold (XAU/USD).
 Real strategy logic with Order Blocks, FVGs, zone tracking, DXY confluence,
-and proactive alerts.
+proactive alerts, error handling, and observability.
 
 ## What This Bot Does (End-to-End)
 
-1. **Watches gold 2H** during London/NY sessions
+1. **Watches gold 2H** during London/NY sessions (no weekends, no off-hours)
 2. **Detects fresh 2H BOS** automatically
 3. **Marks the Order Block** (last opposing candle before impulse, any color)
 4. **Marks the FVG** in the impulse leg if present
-5. **Sends zone to you** with Valid/Poor/Edit buttons
-6. **You confirm valid** → bot saves zone in memory + permanent Telegram log
-7. **Bot watches proximity:** Approaching → Near → Tapped → alerts you each state
-8. **Bot watches 15M** for BOS/CHoCH alignment with the zone
-9. **Signal fires** when 15M trigger hits inside zone with entry/SL/TP at 3R
-10. **DXY confluence** check (must move opposite to your trade)
-11. **Auto-invalidation** when zone fails or signal completes
-12. **Anti-spam:** each alert state fires only once per zone
+5. **Validates zone freshness** — skips zones already tapped or with new structure
+6. **Sends zone to you** with Valid/Poor/Edit buttons
+7. **You confirm valid** → bot saves zone in memory + permanent Telegram log
+8. **Bot watches proximity:** Approaching → Near → Tapped → alerts you each state
+9. **Bot watches 15M** for BOS/CHoCH alignment with the zone
+10. **Signal fires** when 15M trigger hits inside zone with entry/SL/TP at exactly 3R
+11. **DXY confluence** check (must move opposite to your trade)
+12. **Auto-invalidation** when zone fails or signal completes
+13. **Friday wind-down** at 15:00 UTC: no new signals, clears active zones
+14. **Error tracking** with `/status` for Monday troubleshooting
+15. **Anti-spam:** each alert state fires only once per zone
 
 ## Environment Variables (Render Dashboard)
 
@@ -25,7 +28,7 @@ and proactive alerts.
 BOT_TOKEN          — Telegram bot token from @BotFather
 CHAT_ID            — Your Telegram chat ID (from @userinfobot)
 TWELVE_DATA_KEY    — From twelvedata.com (free tier OK)
-GROQ_API_KEY       — Optional, for AI chat features
+GROQ_API_KEY       — Optional, for AI features (not used in current build)
 ```
 
 ## Render Setup
@@ -36,7 +39,7 @@ GROQ_API_KEY       — Optional, for AI chat features
 
 ## Telegram Setup
 
-Set the webhook URL (one time):
+Set the webhook URL (one time, only if URL changes):
 ```
 https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<RENDER_URL>/webhook
 ```
@@ -52,7 +55,9 @@ This both keeps Render warm AND triggers `auto_market_scan()` proactively.
 - `/menu` or `/start` — show dashboard
 - `/scan` — force gold analysis
 - `/zones` — list active zones
-- `/health` — bot status
+- `/status` — **detailed bot diagnostics** (use this for troubleshooting)
+- `/config` — show current strategy parameters
+- `/health` — quick health check
 - `/rules` — entry rules
 - `/checklist` — A+ checklist
 
@@ -82,22 +87,76 @@ Total zone: 4598 – 4620
 - Up to **2 active zones** at a time (oldest replaced if more come)
 - Zones auto-invalidate when price closes beyond them in wrong direction
 - Zone is removed when signal fires (one-shot use)
+- All zones cleared automatically Friday 15:00 UTC
 
-## Validate Before Session 4
+## Zone Freshness Rule
 
-After a few days of running, watch for:
+When a 2H BOS forms, the bot checks before proposing the zone:
+- **Has price already tapped the zone?** If yes, don't propose (smart money already filled).
+- **Has price already closed beyond it (broken structure)?** If yes, don't propose (setup is dead).
+- **Otherwise**, propose it for your validation.
 
-1. ☐ Bot detects 2H BOS that match what you see on TradingView
-2. ☐ Order Blocks marked correctly (last opposing candle before impulse)
-3. ☐ FVGs correctly identified when they exist
-4. ☐ Proximity alerts fire when expected (Approaching/Near/Tapped)
-5. ☐ Signals fire only when 15M trigger aligns
-6. ☐ TP is exactly 3R from entry
-7. ☐ DXY confluence shows correctly
-8. ☐ No spam (each alert fires once per zone)
+This means even if Render restarts and bot wakes up to find a "stale" BOS,
+it won't propose dead setups.
+
+## Friday Wind-Down
+
+At 15:00 UTC on Fridays:
+- Bot stops firing new signals
+- All active zones are cleared
+- You get a wind-down notification
+- Bot resumes Monday at London open (07:00 UTC)
+
+## Monday Troubleshooting Guide
+
+If something feels off Monday morning:
+
+1. **Tap `/status`** — shows last scan times, last DXY check, last error, active zones
+2. **Tap `/health`** — quick alive check
+3. **Tap `/config`** — verify parameters haven't drifted
+4. **Visit `<RENDER_URL>/health`** in browser — JSON status from Render itself
+
+Common issues and how `/status` will reveal them:
+- **No scans happening:** "Last scan" will be old, "Last error" will show why
+- **DXY broken:** "DXY" line will say UNAVAILABLE
+- **Twelve Data quota hit:** Errors will mention "API error" or rate limit
+- **Render cold start:** First request after idle = 30+ sec delay (normal on free tier)
 
 ## Versioning
 
-- v2.0-session1 — Foundation (deployed)
-- v2.0-s1s2s3 — **Current: OB + FVG + Zones + DXY + Proactive Alerts**
-- v2.0-session4 — Polish + stress test (next session)
+- v2.0-session1 — Foundation
+- v2.0-s1s2s3 — Real strategy logic
+- **v2.0-s4-final — Current build (production)**
+
+## Architecture Summary
+
+```
+┌─ Twelve Data API ──────────┐
+│   1H gold → resampled 2H   │
+│   15M gold                 │
+│   1H DXY                   │
+└────────────┬───────────────┘
+             ↓
+┌─ Pure-Python indicators ───┐
+│   ATR, swings, FVG, OB     │
+└────────────┬───────────────┘
+             ↓
+┌─ Strategy logic ───────────┐
+│   2H BOS → OB+FVG zone     │
+│   User validates           │
+│   Proximity tracking       │
+│   15M trigger              │
+│   DXY confluence           │
+│   Friday wind-down         │
+└────────────┬───────────────┘
+             ↓
+┌─ Telegram interface ───────┐
+│   Dashboard menu           │
+│   Inline buttons           │
+│   Hashtag-based logging    │
+│   Status diagnostics       │
+└────────────────────────────┘
+```
+
+No pandas, no numpy, no SQLite. Just Flask, requests, and pure Python.
+Deploys on Render free tier in ~30 seconds.
