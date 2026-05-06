@@ -45,7 +45,7 @@ TWELVE_DATA_KEY  = os.environ.get("TWELVE_DATA_KEY")
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY")  # optional, used for chat
 
 # Strategy parameters
-SWING_LOOKBACK       = 5         # bars on each side
+SWING_LOOKBACK       = 2         # bars on each side (lowered from 5; tested for 2H gold)
 ATR_PERIOD           = 14
 ATR_SIGNIFICANCE     = 0.5       # swing must clear 0.5*ATR
 CONSOLIDATION_RATIO  = 1.5       # range > 1.5*ATR to trade
@@ -449,39 +449,51 @@ def analyze_structure(candles, lookback=SWING_LOOKBACK):
     choch = "None"
     last_high_val = last_low_val = prev_high_val = prev_low_val = None
 
-    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+    # Compute swing values if available — None if we don't have enough.
+    if swing_highs:
         last_high_val = swing_highs[-1][1]
-        prev_high_val = swing_highs[-2][1]
-        last_low_val  = swing_lows[-1][1]
-        prev_low_val  = swing_lows[-2][1]
+        if len(swing_highs) >= 2:
+            prev_high_val = swing_highs[-2][1]
+    if swing_lows:
+        last_low_val = swing_lows[-1][1]
+        if len(swing_lows) >= 2:
+            prev_low_val = swing_lows[-2][1]
 
+    # ── TREND CLASSIFICATION (requires 2 highs AND 2 lows) ──
+    # This is informational. BOS detection below works WITHOUT it.
+    if (len(swing_highs) >= 2 and len(swing_lows) >= 2):
         if last_high_val > prev_high_val and last_low_val > prev_low_val:
             trend = "Bullish"
         elif last_high_val < prev_high_val and last_low_val < prev_low_val:
             trend = "Bearish"
+        # else: trend stays "Ranging"
 
-        # BOS: price closed beyond previous structural swing.
-        # We find the FIRST candle that broke (after the prev swing index),
-        # not the last — that's the candle that actually caused the BOS.
-        if trend == "Bullish" and current_price > prev_high_val:
-            bos = f"Bullish BOS @ `{round(prev_high_val, 2)}`"
-            bos_level = prev_high_val
-            bos_direction = "bullish"
-            prev_high_idx = swing_highs[-2][0]
-            for i in range(prev_high_idx + 1, len(candles)):
-                if candles[i]["close"] > prev_high_val:
-                    bos_index = i
-                    break
-        elif trend == "Bearish" and current_price < prev_low_val:
-            bos = f"Bearish BOS @ `{round(prev_low_val, 2)}`"
-            bos_level = prev_low_val
-            bos_direction = "bearish"
-            prev_low_idx = swing_lows[-2][0]
-            for i in range(prev_low_idx + 1, len(candles)):
-                if candles[i]["close"] < prev_low_val:
-                    bos_index = i
-                    break
+    # ── BOS DETECTION (only needs 1 swing on the relevant side) ──
+    # In SMC, BOS = price closes beyond the most recent significant swing.
+    # We don't need a "confirmed trend" first — BOS is what STARTS a trend.
+    if last_high_val is not None and current_price > last_high_val:
+        bos = f"Bullish BOS @ `{round(last_high_val, 2)}`"
+        bos_level = last_high_val
+        bos_direction = "bullish"
+        last_high_idx = swing_highs[-1][0]
+        for i in range(last_high_idx + 1, len(candles)):
+            if candles[i]["close"] > last_high_val:
+                bos_index = i
+                break
+    elif last_low_val is not None and current_price < last_low_val:
+        bos = f"Bearish BOS @ `{round(last_low_val, 2)}`"
+        bos_level = last_low_val
+        bos_direction = "bearish"
+        last_low_idx = swing_lows[-1][0]
+        for i in range(last_low_idx + 1, len(candles)):
+            if candles[i]["close"] < last_low_val:
+                bos_index = i
+                break
 
+    # ── CHoCH DETECTION ──
+    # CHoCH = first counter-trend break, signaling potential reversal.
+    # Needs an established directional trend AND 2 swings on each side.
+    if (len(swing_highs) >= 2 and len(swing_lows) >= 2):
         if trend == "Bearish" and current_price > prev_high_val:
             choch = f"Bullish CHoCH @ `{round(prev_high_val, 2)}`"
         elif trend == "Bullish" and current_price < prev_low_val:
@@ -646,6 +658,9 @@ def is_zone_already_invalid(zone, candles_after_bos):
                 return True
 
     return False
+
+
+def proximity_state(price, zone, atr):
     """
     Returns state: 'TAPPED' | 'NEAR' | 'APPROACHING' | 'FAR' | 'INVALIDATED'.
     Also handles invalidation (price closed beyond zone in wrong direction).
@@ -1388,6 +1403,36 @@ def auto_market_scan():
 # ─────────────────────────────────────────────────────────────
 # FLASK ROUTES
 # ─────────────────────────────────────────────────────────────
+@app.route("/test_functions")
+def test_functions():
+    """
+    Smoke test endpoint — verifies all critical functions exist and are callable.
+    Hit this after every deploy. Healthy output means the build didn't lose
+    any function definitions during patching.
+    """
+    critical_funcs = [
+        "fetch_candles", "resample_1h_to_2h", "get_2h_data", "get_15m_data",
+        "get_dxy_summary", "compute_atr", "detect_swings", "is_consolidating",
+        "analyze_structure", "detect_order_block", "detect_fvg_in_impulse",
+        "make_zone", "is_zone_already_invalid", "proximity_state",
+        "add_active_zone", "remove_zone", "check_15m_trigger",
+        "calculate_trade_levels", "run_gold_analysis", "auto_market_scan",
+    ]
+    import sys
+    this_module = sys.modules[__name__]
+    results = {}
+    for name in critical_funcs:
+        f = getattr(this_module, name, None)
+        results[name] = "OK" if callable(f) else "MISSING"
+    all_ok = all(v == "OK" for v in results.values())
+    return {
+        "all_functions_ok": all_ok,
+        "missing": [k for k, v in results.items() if v == "MISSING"],
+        "checked": len(critical_funcs),
+        "version": "2.0-s4-fixed",
+    }, 200 if all_ok else 500
+
+
 @app.route("/")
 def root():
     auto_market_scan()
@@ -1410,7 +1455,7 @@ def health():
         "alerts_today": ALERTS_SENT_TODAY,
         "signals_today": SIGNALS_SENT_TODAY,
         "last_error": LAST_ERROR,
-        "version": "2.0-s4-final",
+        "version": "2.0-s4-fixed",
     }, 200
 
 
@@ -1562,7 +1607,7 @@ def webhook():
         elif text == "/health":
             send_telegram(
                 chat_id,
-                f"☑ *Bot Health*\n{DIVIDER}\nVersion: `2.0-s4-final`\nSession: {get_session_label()}\nActive zones: `{len(ACTIVE_ZONES)}`\n{heartbeat_line()}\n\n_For details, use_ `/status`",
+                f"☑ *Bot Health*\n{DIVIDER}\nVersion: `2.0-s4-fixed`\nSession: {get_session_label()}\nActive zones: `{len(ACTIVE_ZONES)}`\n{heartbeat_line()}\n\n_For details, use_ `/status`",
                 back_button(),
             )
         elif text == "/rules":
