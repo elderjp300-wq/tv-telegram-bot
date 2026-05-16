@@ -1,1627 +1,1040 @@
 """
-═══════════════════════════════════════════════════════════════════════
-  JP GOLD BOT — v2.0 (Sessions 1+2+3: Production Build)
-═══════════════════════════════════════════════════════════════════════
-  Built for: Johnpaul Uche
-  Strategy:  Gold-only, 2H structure + 15M trigger, SMC/ICT
-  Stack:     Flask + Telegram + Twelve Data (no pandas/numpy)
+=============================================================================
+JP GOLD BOT v3.0 — Textbook SMC on 15M
+=============================================================================
+Strategy:
+  - 2H timeframe used ONLY for trend context (bullish/bearish/range)
+  - 15M timeframe: detect BOS/CHoCH, locate OB and FVG inside impulse
+  - Composite grading (A+ / A / B / C) decides signal quality
+  - Limit entry at OB open, SL beyond OB invalidation
+  - TP1 fixed 3R, TP2 nearest untouched 2H swing beyond TP1
 
-  WHAT THIS BOT DOES (end-to-end):
-    1.  Watches gold 2H structure during London/NY sessions
-    2.  Detects fresh 2H BOS on gold
-    3.  Marks the Order Block (last opposing candle before impulse)
-    4.  Marks the FVG/imbalance in the impulse leg (if present)
-    5.  Sends zone to user with Valid/Poor buttons
-    6.  If user marks Valid -> bot saves zone in memory + Telegram log
-    7.  Bot watches price proximity to zone (Approaching/Near/Tapped)
-    8.  Bot watches 15M for BOS/CHoCH at the zone
-    9.  When 15M trigger fires inside zone -> SIGNAL FIRES with entry/SL/TP
-   10.  DXY confluence check (must move opposite to trade direction)
-   11.  Auto-invalidation when zone fails or signal completes
-   12.  Anti-spam: each alert state fires once per zone
+Lifecycle:
+  PENDING → ACTIVE → TP1_HIT → TP2_HIT (or SL_HIT or EXPIRED at any point)
+  Add-on alerts fire whenever a same-direction setup forms while a trade is
+  active (fires regardless of P&L per your choice — risk is called out in
+  the message).
 
-  USER INTERFACE:
-    - Single back-button under analysis (no menu stuffing)
-    - Heartbeat indicator on dashboard
-    - Inline buttons for zone validation
-    - Hashtag-based Telegram log (#zone #signal #log)
-═══════════════════════════════════════════════════════════════════════
+Operations:
+  - XAUUSD only
+  - NY + London sessions (07:00 UTC – 22:00 UTC)
+  - Friday wind-down at 17:00 UTC (pending signals cleared)
+  - 0.5% risk on A+/A, 0.25% on B/C
+  - All grades sent; commentary in message tells you which to take
+=============================================================================
 """
 
 import os
 import json
-import requests
+import logging
+import time
 from datetime import datetime, timezone, timedelta
-from flask import Flask, request
+from typing import Optional, List, Dict, Any
 
-# ─────────────────────────────────────────────────────────────
-# CONFIG & ENVIRONMENT
-# ─────────────────────────────────────────────────────────────
-app = Flask(__name__)
+import requests
+from flask import Flask, jsonify, request
+from apscheduler.schedulers.background import BackgroundScheduler
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+)
+import asyncio
 
-BOT_TOKEN        = os.environ.get("BOT_TOKEN")
-CHAT_ID          = os.environ.get("CHAT_ID")
-TWELVE_DATA_KEY  = os.environ.get("TWELVE_DATA_KEY")
-GROQ_API_KEY     = os.environ.get("GROQ_API_KEY")  # optional, used for chat
+# =============================================================================
+# CONFIG
+# =============================================================================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "")
+PORT = int(os.getenv("PORT", "10000"))
+ACCOUNT_SIZE = float(os.getenv("ACCOUNT_SIZE", "5000"))
 
-# Strategy parameters
-SWING_LOOKBACK       = 2         # bars on each side (lowered from 5; tested for 2H gold)
-ATR_PERIOD           = 14
-ATR_SIGNIFICANCE     = 0.5       # swing must clear 0.5*ATR
-CONSOLIDATION_RATIO  = 1.5       # range > 1.5*ATR to trade
-MIN_RR               = 3.0
-RISK_PERCENT         = 0.5
+INSTRUMENT_DISPLAY = "XAUUSD"
+INSTRUMENT_API = "XAU/USD"
 
-# Proximity thresholds (multiples of 2H ATR)
-APPROACH_ATR         = 1.5       # within 1.5*ATR of zone -> APPROACHING
-NEAR_ATR             = 0.5       # within 0.5*ATR of zone -> NEAR
+# Sessions (UTC)
+SESSION_START_UTC = 7      # London opens
+SESSION_END_UTC = 22       # NY closes
+FRIDAY_CUTOFF_HOUR = 17    # Friday wind-down
 
-# 15M strategy params (smaller lookback for faster response)
-LTF_SWING_LOOKBACK   = 3
-LTF_ATR_PERIOD       = 14
+# Timeframes
+TF_2H = "2h"
+TF_15M = "15min"
+CANDLES_2H = 80           # ~6.5 days of 2H bars
+CANDLES_15M = 120         # ~30 hours of 15M bars
 
-# Session windows (UTC)
-LONDON_OPEN, LONDON_CLOSE = 7, 12
-NY_OPEN, NY_CLOSE         = 12, 17
+# Strategy params
+SWING_LOOKBACK = 3        # swing detection — bars on each side
+SIGNAL_EXPIRY_BARS = 8    # 15M bars before pending signal expires (~2h)
+SL_BUFFER_USD = 0.50      # extra buffer beyond OB invalidation for SL
+SCAN_INTERVAL_SECONDS = 120  # how often the scanner runs
 
-# ─────────────────────────────────────────────────────────────
-# GLOBAL STATE (in-memory)
-# ─────────────────────────────────────────────────────────────
-LAST_SCAN_TIME = None
-LAST_2H_SCAN_TIME = None
-LAST_15M_SCAN_TIME = None
-LAST_DXY_CHECK = None         # dict: {time, trend, price}
-LAST_2H_BOS_LEVEL = None      # to dedupe BOS alerts
-LAST_2H_BOS_DIRECTION = None  # tracks if direction has flipped
-LAST_SESSION_OPEN_NOTIFIED = None  # date string of last session-open ping
-LAST_FRIDAY_WINDDOWN = None   # date string of last Friday winddown
-LAST_ERROR = None             # dict: {time, where, message}
-ALERTS_SENT_TODAY = 0
-SIGNALS_SENT_TODAY = 0
-ALERTS_DAY = None             # date string for daily counter reset
+# Grading
+RISK_BY_GRADE = {"A+": 0.005, "A": 0.005, "B": 0.0025, "C": 0.0025}
 
-# Track BOS levels we've already proposed (so we don't re-propose
-# the same setup on every scan). Reset when direction flips.
-PROPOSED_BOS_LEVELS = set()
+# State
+STATE_FILE = "bot_state.json"
 
-# Friday wind-down hour (UTC)
-FRIDAY_WINDDOWN_HOUR = 15     # no new signals after 15:00 UTC Friday
+# =============================================================================
+# LOGGING
+# =============================================================================
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("jp-gold-bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
-# Active zones: list of dicts. Each zone:
-#   {
-#     "id":           "z_2026-05-01_11-30",
-#     "direction":    "bullish" | "bearish",
-#     "ob_high":      4605.0,
-#     "ob_low":       4598.0,
-#     "fvg_high":     4603.0 or None,
-#     "fvg_low":      4596.0 or None,
-#     "created_at":   isoformat string,
-#     "state":        "PENDING" | "VALIDATED" | "APPROACHING" | "NEAR" | "TAPPED" | "DONE"
-#     "alerts_sent":  set of state names already alerted
-#     "bos_level":    the 2H BOS price that triggered this zone
-#   }
-ACTIVE_ZONES = []
-
-# Pending zones awaiting user validation (keyed by zone id)
-PENDING_ZONES = {}
-
-# Pending edit prompts (when user clicked Edit on a zone)
-EDIT_PROMPTS = {}  # chat_id -> zone_id
-
-MAX_ACTIVE_ZONES = 2  # cap
+# =============================================================================
+# STATE
+# =============================================================================
+state: Dict[str, Any] = {
+    "active_trades": [],      # PENDING and ACTIVE trades
+    "completed_trades": [],   # TP_HIT, SL_HIT, EXPIRED — kept for /status
+    "paused": False,
+    "last_scan_ts": None,
+    "last_2h_trend": None,
+    "signals_today": 0,
+    "today_date": None,
+    "bot_started_at": datetime.now(timezone.utc).isoformat(),
+}
 
 
-# ─────────────────────────────────────────────────────────────
-# OBSERVABILITY HELPERS
-# ─────────────────────────────────────────────────────────────
-def log_error(where, message):
-    """Record an error for /status visibility."""
-    global LAST_ERROR
-    LAST_ERROR = {
-        "time":    now_utc().isoformat(),
-        "where":   where,
-        "message": str(message)[:200],  # truncate massive messages
-    }
+def load_state():
+    global state
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                loaded = json.load(f)
+            state.update(loaded)
+            log.info(f"State loaded: {len(state['active_trades'])} active, "
+                     f"{len(state['completed_trades'])} completed")
+        except Exception as e:
+            log.warning(f"Could not load state: {e}. Starting fresh.")
 
 
-def reset_daily_counters_if_needed():
-    """Reset alert/signal counters at the start of each new UTC day."""
-    global ALERTS_SENT_TODAY, SIGNALS_SENT_TODAY, ALERTS_DAY
-    today = now_utc().strftime("%Y-%m-%d")
-    if ALERTS_DAY != today:
-        ALERTS_DAY = today
-        ALERTS_SENT_TODAY = 0
-        SIGNALS_SENT_TODAY = 0
-
-
-def is_friday_winddown():
-    """Returns True if it's Friday after 15:00 UTC — no new signals."""
-    n = now_utc()
-    return n.weekday() == 4 and n.hour >= FRIDAY_WINDDOWN_HOUR
-
-
-# ─────────────────────────────────────────────────────────────
-# TELEGRAM HELPERS
-# ─────────────────────────────────────────────────────────────
-def send_telegram(chat_id, text, reply_markup=None):
-    if not BOT_TOKEN:
-        return None
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
+def save_state():
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        return r.json() if r.status_code == 200 else None
-    except Exception:
-        return None
+        # Cap completed_trades to last 100 to keep file size reasonable
+        if len(state["completed_trades"]) > 100:
+            state["completed_trades"] = state["completed_trades"][-100:]
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+    except Exception as e:
+        log.error(f"Could not save state: {e}")
 
 
-def edit_telegram(chat_id, message_id, text, reply_markup=None):
-    if not BOT_TOKEN:
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-    payload = {
-        "chat_id":    chat_id,
-        "message_id": message_id,
-        "text":       text,
-        "parse_mode": "Markdown",
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception:
-        pass
+def reset_daily_counter():
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("today_date") != today:
+        state["today_date"] = today
+        state["signals_today"] = 0
 
 
-def answer_callback(callback_query_id, text=None):
-    if not BOT_TOKEN:
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
-    payload = {"callback_query_id": callback_query_id}
-    if text:
-        payload["text"] = text
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception:
-        pass
-
-
-# ─────────────────────────────────────────────────────────────
-# SESSION & TIME
-# ─────────────────────────────────────────────────────────────
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
-def is_session_active():
-    n = now_utc()
-    if n.weekday() >= 5:
-        return False
-    h = n.hour
-    return (LONDON_OPEN <= h < LONDON_CLOSE) or (NY_OPEN <= h < NY_CLOSE)
-
-
-def get_session_label():
-    n = now_utc()
-    if n.weekday() >= 5:
-        return "Weekend ◯"
-    h = n.hour
-    if LONDON_OPEN <= h < LONDON_CLOSE:
-        return "London ●"
-    elif NY_OPEN <= h < NY_CLOSE:
-        return "New York ●"
-    return "Off-Session ◯"
-
-
-def get_next_session():
-    n = now_utc()
-    h = n.hour
-    if n.weekday() >= 5:
-        return "Markets reopen Monday"
-    if h < LONDON_OPEN:
-        return f"London opens in {LONDON_OPEN - h}h"
-    elif h < LONDON_CLOSE:
-        return "London active"
-    elif h < NY_CLOSE:
-        return "New York active"
-    else:
-        return f"London opens in {(24 - h) + LONDON_OPEN}h"
-
-
-def heartbeat_line():
-    if LAST_SCAN_TIME:
-        last = LAST_SCAN_TIME.strftime("%H:%M UTC")
-        zones_count = len(ACTIVE_ZONES)
-        zones_str = f"  ▪︎  Zones: {zones_count}" if zones_count else ""
-        return f"☑ Online  ▪︎  Last scan: `{last}`{zones_str}"
-    return "☑ Online  ▪︎  Awaiting first scan"
-
-
-# ─────────────────────────────────────────────────────────────
-# DATA LAYER
-# ─────────────────────────────────────────────────────────────
-def fetch_candles(symbol, interval, outputsize):
-    """Fetch raw candles. Returns list of dicts (oldest first), or None."""
+# =============================================================================
+# TWELVE DATA FETCHING
+# =============================================================================
+def fetch_candles(timeframe: str, count: int) -> Optional[List[Dict]]:
+    """Fetch OHLC from Twelve Data. Returns list of candle dicts (oldest first)."""
     if not TWELVE_DATA_KEY:
-        log_error("fetch_candles", "TWELVE_DATA_KEY not set")
+        log.error("TWELVE_DATA_KEY not set")
         return None
     url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
+        "symbol": INSTRUMENT_API,
+        "interval": timeframe,
+        "outputsize": count,
         "apikey": TWELVE_DATA_KEY,
         "format": "JSON",
     }
     try:
-        res = requests.get(url, params=params, timeout=15).json()
-        if res.get("status") == "error":
-            log_error("fetch_candles", f"{symbol} {interval}: {res.get('message', 'API error')}")
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") == "error":
+            log.error(f"Twelve Data error: {data.get('message')}")
             return None
-        candles = res.get("values", [])
-        if not candles:
-            log_error("fetch_candles", f"{symbol} {interval}: empty response")
+        values = data.get("values", [])
+        if not values:
+            log.warning(f"No candles returned for {timeframe}")
             return None
-        clean = []
-        for c in candles:
-            try:
-                clean.append({
-                    "datetime": c["datetime"],
-                    "open":     float(c["open"]),
-                    "high":     float(c["high"]),
-                    "low":      float(c["low"]),
-                    "close":    float(c["close"]),
-                })
-            except (KeyError, ValueError):
-                continue
-        clean.reverse()
-        return clean
+        # Reverse to oldest-first and normalize
+        candles = []
+        for v in reversed(values):
+            candles.append({
+                "time": v["datetime"],
+                "open": float(v["open"]),
+                "high": float(v["high"]),
+                "low": float(v["low"]),
+                "close": float(v["close"]),
+            })
+        return candles
     except Exception as e:
-        log_error("fetch_candles", f"{symbol} {interval}: {e}")
+        log.error(f"fetch_candles({timeframe}) failed: {e}")
         return None
 
 
-def resample_1h_to_2h(candles_1h):
-    """Bucket 1H candles into 2H buckets aligned to even hours."""
-    if not candles_1h:
-        return None
-    buckets = {}
-    for c in candles_1h:
-        dt = datetime.fromisoformat(c["datetime"].replace(" ", "T"))
-        bucket_hour = (dt.hour // 2) * 2
-        bucket_key = dt.replace(hour=bucket_hour, minute=0, second=0, microsecond=0)
-        if bucket_key not in buckets:
-            buckets[bucket_key] = {
-                "datetime": bucket_key.isoformat(),
-                "open":  c["open"],
-                "high":  c["high"],
-                "low":   c["low"],
-                "close": c["close"],
-            }
-        else:
-            b = buckets[bucket_key]
-            b["high"]  = max(b["high"], c["high"])
-            b["low"]   = min(b["low"],  c["low"])
-            b["close"] = c["close"]
-    return [buckets[k] for k in sorted(buckets.keys())]
-
-
-def get_2h_data(bars=30):
-    global LAST_2H_SCAN_TIME
-    needed = bars * 2 + 4
-    raw = fetch_candles("XAU/USD", "1h", needed)
-    if not raw or len(raw) < 10:
-        return None
-    res = resample_1h_to_2h(raw)
-    if not res or len(res) < 10:
-        return None
-    LAST_2H_SCAN_TIME = now_utc()
-    return res[-bars:]
-
-
-def get_15m_data(bars=40):
-    global LAST_15M_SCAN_TIME
-    candles = fetch_candles("XAU/USD", "15min", bars)
-    if candles:
-        LAST_15M_SCAN_TIME = now_utc()
-    return candles
-
-
-def get_dxy_summary():
-    """
-    Returns dict: {trend: 'BULLISH'|'BEARISH'|'NEUTRAL'|'UNAVAILABLE',
-                   price: float or None}
-    Uses 1H DXY swings to determine direction.
-    """
-    global LAST_DXY_CHECK
-    candles = fetch_candles("DXY", "1h", 24)
-    if not candles or len(candles) < 15:
-        # Try alternative symbol
-        candles = fetch_candles("USDIDX", "1h", 24)
-    if not candles or len(candles) < 15:
-        result = {"trend": "UNAVAILABLE", "price": None}
-        LAST_DXY_CHECK = {"time": now_utc().isoformat(), **result}
-        return result
-
-    atr_list = compute_atr(candles, period=14)
-    swing_h, swing_l = detect_swings(candles, atr_list, lookback=3)
-
-    if len(swing_h) < 2 or len(swing_l) < 2:
-        result = {"trend": "NEUTRAL", "price": round(candles[-1]["close"], 2)}
-        LAST_DXY_CHECK = {"time": now_utc().isoformat(), **result}
-        return result
-
-    last_h = swing_h[-1][1]
-    prev_h = swing_h[-2][1]
-    last_l = swing_l[-1][1]
-    prev_l = swing_l[-2][1]
-
-    if last_h > prev_h and last_l > prev_l:
-        trend = "BULLISH"
-    elif last_h < prev_h and last_l < prev_l:
-        trend = "BEARISH"
-    else:
-        trend = "NEUTRAL"
-
-    result = {"trend": trend, "price": round(candles[-1]["close"], 2)}
-    LAST_DXY_CHECK = {"time": now_utc().isoformat(), **result}
-    return result
-
-
-# ─────────────────────────────────────────────────────────────
-# INDICATORS (pure Python)
-# ─────────────────────────────────────────────────────────────
-def compute_atr(candles, period=ATR_PERIOD):
-    if not candles or len(candles) < period + 1:
-        return [None] * len(candles) if candles else []
-    tr_list = [None]
-    for i in range(1, len(candles)):
-        h, l = candles[i]["high"], candles[i]["low"]
-        prev_close = candles[i - 1]["close"]
-        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
-        tr_list.append(tr)
-    atr_list = [None] * len(candles)
-    for i in range(period, len(candles)):
-        window = tr_list[i - period + 1:i + 1]
-        if all(x is not None for x in window):
-            atr_list[i] = sum(window) / period
-    return atr_list
-
-
-def detect_swings(candles, atr_list, lookback=SWING_LOOKBACK):
-    """Returns (highs, lows) as [(index, price), ...]."""
-    swing_highs, swing_lows = [], []
-    n = len(candles)
-    for i in range(lookback, n - lookback):
-        win_h = [candles[j]["high"] for j in range(i - lookback, i + lookback + 1)]
-        win_l = [candles[j]["low"]  for j in range(i - lookback, i + lookback + 1)]
-        local_avg = sum(c["close"] for c in candles[i - lookback:i + lookback + 1]) / (2 * lookback + 1)
-        atr_here = atr_list[i] if atr_list[i] is not None else None
-
-        if candles[i]["high"] == max(win_h):
-            if atr_here is None or abs(candles[i]["high"] - local_avg) >= ATR_SIGNIFICANCE * atr_here:
-                swing_highs.append((i, candles[i]["high"]))
-        if candles[i]["low"] == min(win_l):
-            if atr_here is None or abs(candles[i]["low"] - local_avg) >= ATR_SIGNIFICANCE * atr_here:
-                swing_lows.append((i, candles[i]["low"]))
-    return swing_highs, swing_lows
-
-
-def is_consolidating(candles, atr_list):
-    if len(candles) < 10:
-        return False
-    recent = candles[-10:]
-    range_size = max(c["high"] for c in recent) - min(c["low"] for c in recent)
-    recent_atrs = [a for a in atr_list[-10:] if a is not None]
-    if not recent_atrs:
-        return False
-    avg_atr = sum(recent_atrs) / len(recent_atrs)
-    if avg_atr == 0:
-        return False
-    return range_size < (CONSOLIDATION_RATIO * avg_atr)
-
-
-# ─────────────────────────────────────────────────────────────
-# STRUCTURE ANALYSIS
-# ─────────────────────────────────────────────────────────────
-def analyze_structure(candles, lookback=SWING_LOOKBACK):
-    """
-    Returns dict with structural read.
-    Also includes BOS/CHoCH index for downstream OB/FVG detection.
-    """
-    if not candles or len(candles) < 15:
-        return None
-
-    atr_list = compute_atr(candles)
-    swing_highs, swing_lows = detect_swings(candles, atr_list, lookback)
-    consolidating = is_consolidating(candles, atr_list)
-
-    current_price = candles[-1]["close"]
-    atr_now = atr_list[-1]
-
-    trend = "Ranging"
-    bos = "None"
-    bos_level = None
-    bos_index = None
-    bos_direction = None  # "bullish" | "bearish"
-    choch = "None"
-    last_high_val = last_low_val = prev_high_val = prev_low_val = None
-
-    # Compute swing values if available — None if we don't have enough.
-    if swing_highs:
-        last_high_val = swing_highs[-1][1]
-        if len(swing_highs) >= 2:
-            prev_high_val = swing_highs[-2][1]
-    if swing_lows:
-        last_low_val = swing_lows[-1][1]
-        if len(swing_lows) >= 2:
-            prev_low_val = swing_lows[-2][1]
-
-    # ── TREND CLASSIFICATION (requires 2 highs AND 2 lows) ──
-    # This is informational. BOS detection below works WITHOUT it.
-    if (len(swing_highs) >= 2 and len(swing_lows) >= 2):
-        if last_high_val > prev_high_val and last_low_val > prev_low_val:
-            trend = "Bullish"
-        elif last_high_val < prev_high_val and last_low_val < prev_low_val:
-            trend = "Bearish"
-        # else: trend stays "Ranging"
-
-    # ── BOS DETECTION (only needs 1 swing on the relevant side) ──
-    # In SMC, BOS = price closes beyond the most recent significant swing.
-    # We don't need a "confirmed trend" first — BOS is what STARTS a trend.
-    if last_high_val is not None and current_price > last_high_val:
-        bos = f"Bullish BOS @ `{round(last_high_val, 2)}`"
-        bos_level = last_high_val
-        bos_direction = "bullish"
-        last_high_idx = swing_highs[-1][0]
-        for i in range(last_high_idx + 1, len(candles)):
-            if candles[i]["close"] > last_high_val:
-                bos_index = i
-                break
-    elif last_low_val is not None and current_price < last_low_val:
-        bos = f"Bearish BOS @ `{round(last_low_val, 2)}`"
-        bos_level = last_low_val
-        bos_direction = "bearish"
-        last_low_idx = swing_lows[-1][0]
-        for i in range(last_low_idx + 1, len(candles)):
-            if candles[i]["close"] < last_low_val:
-                bos_index = i
-                break
-
-    # ── CHoCH DETECTION ──
-    # CHoCH = first counter-trend break, signaling potential reversal.
-    # Needs an established directional trend AND 2 swings on each side.
-    if (len(swing_highs) >= 2 and len(swing_lows) >= 2):
-        if trend == "Bearish" and current_price > prev_high_val:
-            choch = f"Bullish CHoCH @ `{round(prev_high_val, 2)}`"
-        elif trend == "Bullish" and current_price < prev_low_val:
-            choch = f"Bearish CHoCH @ `{round(prev_low_val, 2)}`"
-
-    recent_window = candles[-20:] if len(candles) >= 20 else candles
-    return {
-        "trend":           trend,
-        "current_price":   round(current_price, 2),
-        "recent_high":     round(max(c["high"] for c in recent_window), 2),
-        "recent_low":      round(min(c["low"]  for c in recent_window), 2),
-        "bos":             bos,
-        "bos_level":       bos_level,
-        "bos_index":       bos_index,
-        "bos_direction":   bos_direction,
-        "choch":           choch,
-        "last_swing_high": round(last_high_val, 2) if last_high_val else None,
-        "last_swing_low":  round(last_low_val, 2)  if last_low_val  else None,
-        "consolidating":   consolidating,
-        "atr":             round(atr_now, 2) if atr_now else None,
-        "atr_raw":         atr_now,
-        "candles":         candles,
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-# ORDER BLOCK DETECTION
-# ─────────────────────────────────────────────────────────────
-def detect_order_block(candles, bos_index, bos_direction, max_lookback=10):
-    """
-    Walk backward from the BOS-causing candle to find the Order Block.
-    OB = the last candle whose direction OPPOSES the eventual breakout move.
-
-    For a bullish BOS: OB = the last bearish candle before the bullish impulse
-    For a bearish BOS: OB = the last bullish candle before the bearish impulse
-
-    Returns dict {high, low, index} or None.
-    """
-    if bos_index is None or bos_index < 1:
-        return None
-
-    start = max(0, bos_index - max_lookback)
-    # Walk backward from bos_index - 1
-    for i in range(bos_index - 1, start - 1, -1):
+# =============================================================================
+# STRUCTURE DETECTION
+# =============================================================================
+def detect_swings(candles: List[Dict], lookback: int = SWING_LOOKBACK) -> List[Dict]:
+    """Identify swing highs/lows. Swing requires `lookback` bars on each side."""
+    swings = []
+    for i in range(lookback, len(candles) - lookback):
         c = candles[i]
-        is_bullish_candle = c["close"] > c["open"]
-        is_bearish_candle = c["close"] < c["open"]
-
-        if bos_direction == "bullish" and is_bearish_candle:
-            # last bearish candle before bullish impulse
-            return {"high": c["high"], "low": c["low"], "index": i}
-        elif bos_direction == "bearish" and is_bullish_candle:
-            # last bullish candle before bearish impulse
-            return {"high": c["high"], "low": c["low"], "index": i}
-
-    return None
+        is_high = all(candles[i + j]["high"] <= c["high"]
+                      for j in range(-lookback, lookback + 1) if j != 0)
+        is_low = all(candles[i + j]["low"] >= c["low"]
+                     for j in range(-lookback, lookback + 1) if j != 0)
+        if is_high:
+            swings.append({"idx": i, "type": "high", "price": c["high"], "time": c["time"]})
+        if is_low:
+            swings.append({"idx": i, "type": "low", "price": c["low"], "time": c["time"]})
+    return swings
 
 
-# ─────────────────────────────────────────────────────────────
-# FVG / IMBALANCE DETECTION
-# ─────────────────────────────────────────────────────────────
-def detect_fvg_in_impulse(candles, ob_index, bos_index, bos_direction):
-    """
-    Scan the impulse leg between OB and BOS for a 3-candle FVG.
+def determine_trend(candles: List[Dict]) -> str:
+    """Determine market structure: bullish, bearish, or range."""
+    swings = detect_swings(candles, lookback=SWING_LOOKBACK)
+    highs = [s for s in swings if s["type"] == "high"][-3:]
+    lows = [s for s in swings if s["type"] == "low"][-3:]
+    if len(highs) < 2 or len(lows) < 2:
+        return "range"
+    hh = all(highs[i]["price"] > highs[i - 1]["price"] for i in range(1, len(highs)))
+    hl = all(lows[i]["price"] > lows[i - 1]["price"] for i in range(1, len(lows)))
+    lh = all(highs[i]["price"] < highs[i - 1]["price"] for i in range(1, len(highs)))
+    ll = all(lows[i]["price"] < lows[i - 1]["price"] for i in range(1, len(lows)))
+    if hh and hl:
+        return "bullish"
+    if lh and ll:
+        return "bearish"
+    return "range"
 
-    Bullish FVG: candle[i-1].high < candle[i+1].low  (gap zone is between them)
-    Bearish FVG: candle[i-1].low  > candle[i+1].high
 
-    Returns dict {high, low, index} or None.
-    """
-    if ob_index is None or bos_index is None or bos_index <= ob_index + 2:
+def detect_15m_break(candles: List[Dict]) -> Optional[Dict]:
+    """Detect BOS or CHoCH on most recent closed 15M candle."""
+    if len(candles) < SWING_LOOKBACK * 2 + 2:
+        return None
+    # Last fully-closed candle is the one that just printed
+    last_idx = len(candles) - 1
+    last = candles[last_idx]
+    # Detect swings up to (but not including) last candle
+    swings = detect_swings(candles[:last_idx], lookback=SWING_LOOKBACK)
+    if not swings:
         return None
 
-    # Search window between OB and BOS
-    for i in range(ob_index + 1, bos_index):
-        if i < 1 or i >= len(candles) - 1:
-            continue
-        c_prev = candles[i - 1]
-        c_next = candles[i + 1]
+    # Most recent swing high → bullish break if close above it
+    recent_high = next((s for s in reversed(swings) if s["type"] == "high"), None)
+    if recent_high and last["close"] > recent_high["price"]:
+        return {
+            "direction": "bullish",
+            "bos_idx": last_idx,
+            "bos_candle": last,
+            "broken_swing": recent_high,
+        }
 
-        if bos_direction == "bullish":
-            if c_prev["high"] < c_next["low"]:
-                # Bullish FVG: gap between c_prev.high and c_next.low
-                return {
-                    "high":  c_next["low"],
-                    "low":   c_prev["high"],
-                    "index": i,
-                }
-        else:  # bearish
-            if c_prev["low"] > c_next["high"]:
-                return {
-                    "high":  c_prev["low"],
-                    "low":   c_next["high"],
-                    "index": i,
-                }
+    # Most recent swing low → bearish break if close below
+    recent_low = next((s for s in reversed(swings) if s["type"] == "low"), None)
+    if recent_low and last["close"] < recent_low["price"]:
+        return {
+            "direction": "bearish",
+            "bos_idx": last_idx,
+            "bos_candle": last,
+            "broken_swing": recent_low,
+        }
+
     return None
 
 
-# ─────────────────────────────────────────────────────────────
-# ZONE LIFECYCLE
-# ─────────────────────────────────────────────────────────────
-def make_zone(direction, ob, fvg, bos_level):
-    """Build a zone dict from OB and optional FVG."""
-    # Combine OB and FVG into the trade zone.
-    # If FVG exists, the zone is the union (OB + FVG envelope).
-    if fvg:
-        zone_high = max(ob["high"], fvg["high"])
-        zone_low  = min(ob["low"],  fvg["low"])
+def find_order_block(candles: List[Dict], bos: Dict) -> Optional[Dict]:
+    """Locate the OB — last opposing-color candle inside the impulse leg."""
+    direction = bos["direction"]
+    bos_idx = bos["bos_idx"]
+    broken_idx = bos["broken_swing"]["idx"]
+    # Walk back from BOS toward broken swing
+    for i in range(bos_idx - 1, broken_idx, -1):
+        c = candles[i]
+        is_bearish = c["close"] < c["open"]
+        is_bullish = c["close"] > c["open"]
+        if direction == "bullish" and is_bearish:
+            return {"idx": i, **c}
+        if direction == "bearish" and is_bullish:
+            return {"idx": i, **c}
+    return None
+
+
+def find_fvg(candles: List[Dict], bos: Dict, ob_idx: int) -> Optional[Dict]:
+    """Look for 3-bar FVG inside the impulse leg between OB and BOS."""
+    direction = bos["direction"]
+    bos_idx = bos["bos_idx"]
+    for i in range(ob_idx + 1, bos_idx - 1):
+        c1 = candles[i]
+        c3 = candles[i + 2]
+        if direction == "bullish" and c1["high"] < c3["low"]:
+            return {"low": c1["high"], "high": c3["low"], "idx": i + 1}
+        if direction == "bearish" and c1["low"] > c3["high"]:
+            return {"low": c3["high"], "high": c1["low"], "idx": i + 1}
+    return None
+
+
+# =============================================================================
+# GRADING
+# =============================================================================
+def compute_levels(direction: str, ob: Dict) -> Dict:
+    """Calculate entry, SL, TP1 (3R) from OB."""
+    entry = ob["open"]
+    if direction == "bullish":
+        sl = ob["low"] - SL_BUFFER_USD
+        risk = entry - sl
+        tp1 = entry + 3 * risk
     else:
-        zone_high = ob["high"]
-        zone_low  = ob["low"]
+        sl = ob["high"] + SL_BUFFER_USD
+        risk = sl - entry
+        tp1 = entry - 3 * risk
+    return {"entry": entry, "sl": sl, "tp1": tp1, "risk": abs(entry - sl)}
 
-    zid = "z_" + now_utc().strftime("%Y%m%d_%H%M%S")
+
+def find_tp2(direction: str, entry: float, tp1: float,
+             swings_2h: List[Dict]) -> Optional[float]:
+    """Nearest untouched 2H swing beyond TP1."""
+    if direction == "bullish":
+        candidates = [s["price"] for s in swings_2h
+                      if s["type"] == "high" and s["price"] > tp1]
+        return min(candidates) if candidates else None
+    else:
+        candidates = [s["price"] for s in swings_2h
+                      if s["type"] == "low" and s["price"] < tp1]
+        return max(candidates) if candidates else None
+
+
+def grade_setup(direction: str, fvg: Optional[Dict], levels: Dict,
+                trend_2h: str, swings_2h: List[Dict]) -> Dict:
+    """Composite scoring → letter grade."""
+    score = 0
+    factors = []
+
+    # +2 Trend alignment
+    if (direction == "bullish" and trend_2h == "bullish") or \
+       (direction == "bearish" and trend_2h == "bearish"):
+        score += 2
+        factors.append(("✓", f"Trend aligned (2H {trend_2h})"))
+    else:
+        factors.append(("✗", f"Trend not aligned (2H {trend_2h})"))
+
+    # +1 FVG present
+    if fvg:
+        score += 1
+        factors.append(("✓", "FVG in impulse"))
+    else:
+        factors.append(("✗", "No FVG in impulse"))
+
+    # +1 NY or London session
+    hour = datetime.now(timezone.utc).hour
+    if 12 <= hour < 22:
+        score += 1
+        factors.append(("✓", "NY session"))
+    elif SESSION_START_UTC <= hour < 12:
+        score += 1
+        factors.append(("✓", "London session"))
+    else:
+        factors.append(("✗", "Off-session"))
+
+    # +1 Clean OB (any newly-identified OB is clean by definition)
+    score += 1
+    factors.append(("✓", "Clean OB (no prior taps)"))
+
+    # +1 Room to nearest opposing 2H swing > 1.5R
+    target_15r = (levels["entry"] + 1.5 * levels["risk"]
+                  if direction == "bullish"
+                  else levels["entry"] - 1.5 * levels["risk"])
+    if direction == "bullish":
+        nearest = min((s["price"] for s in swings_2h
+                       if s["type"] == "high" and s["price"] > levels["entry"]),
+                      default=None)
+        room_ok = nearest is not None and nearest > target_15r
+    else:
+        nearest = max((s["price"] for s in swings_2h
+                       if s["type"] == "low" and s["price"] < levels["entry"]),
+                      default=None)
+        room_ok = nearest is not None and nearest < target_15r
+    if room_ok:
+        score += 1
+        factors.append(("✓", "Room to 2H swing > 1.5R"))
+    else:
+        factors.append(("✗", "Tight 2H room (< 1.5R)"))
+
+    # Letter grade
+    if score >= 5:
+        grade = "A+"
+    elif score >= 4:
+        grade = "A"
+    elif score >= 3:
+        grade = "B"
+    else:
+        grade = "C"
+
     return {
-        "id":          zid,
-        "direction":   direction,        # "bullish" or "bearish"
-        "ob_high":     ob["high"],
-        "ob_low":      ob["low"],
-        "fvg_high":    fvg["high"] if fvg else None,
-        "fvg_low":     fvg["low"]  if fvg else None,
-        "zone_high":   zone_high,
-        "zone_low":    zone_low,
-        "bos_level":   bos_level,
-        "created_at":  now_utc().isoformat(),
-        "state":       "PENDING",
-        "alerts_sent": [],  # list of state strings already alerted
+        "score": score,
+        "grade": grade,
+        "factors": factors,
+        "risk_pct": RISK_BY_GRADE[grade],
     }
 
 
-def is_zone_already_invalid(zone, candles_after_bos):
-    """
-    Per JP's rule: a freshly-detected zone is invalid if EITHER:
-      1. Price has already tapped it (filled the zone), OR
-      2. New structure has already formed beyond it (BOS in opposite direction
-         after the original BOS — meaning original setup is no longer active)
-
-    candles_after_bos: list of candles from BOS index onward.
-    Returns True if zone should NOT be proposed.
-    """
-    if not candles_after_bos:
-        return False
-
-    zh, zl = zone["zone_high"], zone["zone_low"]
-    direction = zone["direction"]
-
-    # Check 1: has price already tapped the zone?
-    for c in candles_after_bos:
-        if c["low"] <= zh and c["high"] >= zl:
-            return True  # already tapped -> invalid for proposal
-
-    # Check 2: has new structure formed in opposite direction?
-    # For bullish zone: opposite-direction structure = bearish move that
-    # closes below the zone (a bearish BOS would be even stronger but
-    # for a freshness check, "any close below zone" is sufficient).
-    if direction == "bullish":
-        for c in candles_after_bos:
-            if c["close"] < zl:
-                return True
-    else:  # bearish zone
-        for c in candles_after_bos:
-            if c["close"] > zh:
-                return True
-
-    return False
-
-
-def proximity_state(price, zone, atr):
-    """
-    Returns state: 'TAPPED' | 'NEAR' | 'APPROACHING' | 'FAR' | 'INVALIDATED'.
-    Also handles invalidation (price closed beyond zone in wrong direction).
-    """
-    if atr is None or atr == 0:
-        return "FAR"
-
-    zh, zl = zone["zone_high"], zone["zone_low"]
-    direction = zone["direction"]
-
-    # Check tapped (price inside zone)
-    if zl <= price <= zh:
-        return "TAPPED"
-
-    # Compute distance to nearest edge
-    if direction == "bullish":
-        # For bullish zone, we expect price coming DOWN to zone from above
-        dist = price - zh  # positive if above zone
-        if dist < 0:
-            # Price is BELOW zone -> blew through it
-            return "INVALIDATED"
-    else:  # bearish
-        # For bearish zone, we expect price coming UP from below
-        dist = zl - price  # positive if below zone
-        if dist < 0:
-            # Price is ABOVE zone -> blew through
-            return "INVALIDATED"
-
-    if dist <= NEAR_ATR * atr:
-        return "NEAR"
-    elif dist <= APPROACH_ATR * atr:
-        return "APPROACHING"
-    return "FAR"
-
-
-def add_active_zone(zone):
-    """Add zone to active list, respecting the cap."""
-    global ACTIVE_ZONES
-    if len(ACTIVE_ZONES) >= MAX_ACTIVE_ZONES:
-        # Remove the oldest one
-        ACTIVE_ZONES.pop(0)
-    ACTIVE_ZONES.append(zone)
-
-
-def remove_zone(zone_id):
-    global ACTIVE_ZONES
-    ACTIVE_ZONES = [z for z in ACTIVE_ZONES if z["id"] != zone_id]
-
-
-# ─────────────────────────────────────────────────────────────
-# 15M TRIGGER DETECTION
-# ─────────────────────────────────────────────────────────────
-def check_15m_trigger(zone):
-    """
-    Check 15M for BOS or CHoCH that aligns with the zone direction.
-    Returns dict {fired: bool, type: str, level: float} or {fired: False, ...}.
-    """
-    candles_15m = get_15m_data(bars=40)
-    if not candles_15m or len(candles_15m) < 15:
-        return {"fired": False, "reason": "no 15M data"}
-
-    structure = analyze_structure(candles_15m, lookback=LTF_SWING_LOOKBACK)
-    if not structure:
-        return {"fired": False, "reason": "15M structure unclear"}
-
-    direction = zone["direction"]
-
-    # Bullish zone needs bullish 15M trigger (BOS up or CHoCH up)
-    if direction == "bullish":
-        if structure["bos_direction"] == "bullish":
-            return {"fired": True, "type": "15M Bullish BOS", "level": structure["bos_level"]}
-        if "Bullish CHoCH" in structure["choch"]:
-            return {"fired": True, "type": "15M Bullish CHoCH",
-                    "level": structure["last_swing_high"]}
-    else:  # bearish zone
-        if structure["bos_direction"] == "bearish":
-            return {"fired": True, "type": "15M Bearish BOS", "level": structure["bos_level"]}
-        if "Bearish CHoCH" in structure["choch"]:
-            return {"fired": True, "type": "15M Bearish CHoCH",
-                    "level": structure["last_swing_low"]}
-
-    return {"fired": False, "reason": "no 15M trigger yet"}
-
-
-# ─────────────────────────────────────────────────────────────
-# TRADE LEVEL CALCULATION (matches your chart model)
-# ─────────────────────────────────────────────────────────────
-def calculate_trade_levels(zone, current_price):
-    """
-    Entry at OB zone, SL beyond OB with buffer, TP at exactly 3R.
-    Matches the JP entry model: entry=OB, SL=just beyond OB, TP=3R.
-    """
-    direction = zone["direction"]
-    ob_high = zone["ob_high"]
-    ob_low = zone["ob_low"]
-    zone_height = ob_high - ob_low
-    buffer = max(zone_height * 0.15, 0.5)  # small buffer beyond OB
-
-    if direction == "bullish":
-        entry = (ob_high + ob_low) / 2  # mid-zone for limit order
-        sl    = ob_low - buffer
-        risk  = entry - sl
-        if risk <= 0:
-            return None
-        tp = entry + (risk * MIN_RR)
-    else:  # bearish
-        entry = (ob_high + ob_low) / 2
-        sl    = ob_high + buffer
-        risk  = sl - entry
-        if risk <= 0:
-            return None
-        tp = entry - (risk * MIN_RR)
-
-    return {
-        "entry":      round(entry, 2),
-        "sl":         round(sl, 2),
-        "tp":         round(tp, 2),
-        "risk":       round(risk, 2),
-        "rr":         MIN_RR,
-        "direction":  direction,
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-# DISPLAY MESSAGES
-# ─────────────────────────────────────────────────────────────
-DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-
-def back_button():
-    return {"inline_keyboard": [[{"text": "▪︎ Back to Dashboard", "callback_data": "dashboard"}]]}
-
-
-def main_menu():
-    return {
-        "inline_keyboard": [
-            [{"text": "🪙  Gold — Deep Analysis", "callback_data": "analyze_gold"}],
-            [{"text": "🔔  Force Scan",           "callback_data": "force_scan"}],
-            [
-                {"text": "▫️ Active Zones",   "callback_data": "active_zones"},
-                {"text": "▫️ Bot Status",      "callback_data": "status"},
-            ],
-            [
-                {"text": "▫️ Entry Rules",    "callback_data": "rules"},
-                {"text": "▫️ A+ Checklist",   "callback_data": "checklist"},
-            ],
-            [
-                {"text": "▫️ Session",         "callback_data": "session_info"},
-                {"text": "▫️ Trade Log",       "callback_data": "trade_log"},
-            ],
-        ]
-    }
-
-
-def zone_validation_buttons(zone_id):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "✓ Valid", "callback_data": f"valid_{zone_id}"},
-                {"text": "✗ Poor",  "callback_data": f"poor_{zone_id}"},
-            ],
-            [{"text": "✏️ Edit", "callback_data": f"edit_{zone_id}"}],
-            [{"text": "▪︎ Back to Dashboard", "callback_data": "dashboard"}],
-        ]
-    }
-
-
-def dashboard_message():
-    n = now_utc().strftime("%H:%M UTC")
-    status = "● MARKET ACTIVE" if is_session_active() else "◯ MARKET CLOSED"
-    return f"""
-*JP GOLD BOT*  ▪︎  v2.0
-{DIVIDER}
-{status}
-{get_session_label()}  ▪︎  `{n}`
-{get_next_session()}
-{DIVIDER}
-*Asset:*    🪙 XAU/USD only
-*Method:*   2H structure → 15M trigger
-*System:*   SMC ▪︎ Min 3R ▪︎ 0.5% risk
-{DIVIDER}
-{heartbeat_line()}
-"""
-
-
-def rules_message():
-    return f"""
-⚔️  *JP GOLD STRATEGY — ENTRY RULES*
-{DIVIDER}
-
-*1.  HTF READ (2H)*
-   ▪︎  Identify trend (HH/HL bullish or LH/LL bearish)
-   ▪︎  Wait for Break of Structure (BOS)
-
-*2.  ZONE MARKING*
-   ▪︎  Locate the imbalance/FVG that caused the BOS
-   ▪︎  Mark Order Block (last opposite candle before impulse)
-   ▪︎  Confirm zone validity manually (Valid / Poor)
-
-*3.  ENTRY TRIGGER (15M)*
-   ▪︎  Wait for price to approach or tap marked zone
-   ▪︎  Look for 15M BOS or CHoCH inside or near zone
-   ▪︎  Entry only on confirmation
-
-*4.  EXECUTION*
-   ▪︎  Entry at OB mid-zone
-   ▪︎  SL just beyond OB (with small buffer)
-   ▪︎  TP at exactly 3R from entry
-
-*5.  CONFLUENCE*
-   ▪︎  DXY moving opposite to trade direction
-   ▪︎  Active session: London or New York
-
-*6.  RISK*
-   ▪︎  0.5% per trade
-   ▪︎  No Friday evening holds
-   ▪︎  No revenge trades after stop-out
-
-{DIVIDER}
-⚠ Miss any rule → NO TRADE
-"""
-
-
-def checklist_message():
-    return f"""
-☑  *JP GOLD A+ CHECKLIST*
-{DIVIDER}
-*Pre-trade — must pass:*
-
-▫️  2H trend clear (Bullish or Bearish)
-▫️  Fresh 2H BOS confirmed
-▫️  Zone marked and validated by me
-▫️  Price approaching, near, or inside zone
-▫️  15M BOS or CHoCH at the zone
-▫️  DXY moving opposite to trade
-▫️  Active session (London / NY)
-▫️  Min 3R achievable to logical TP
-
-{DIVIDER}
-*8/8*  → SIGNAL FIRES
-*6–7/8*  → WATCHLIST
-*<6*  → NO TRADE
-⚠ If any of the first 5 missing → SKIP
-"""
-
-
-def session_status_message():
-    n = now_utc().strftime("%H:%M UTC")
-    active = is_session_active()
-    return f"""
-*SESSION STATUS*
-{DIVIDER}
-Current:    {get_session_label()}
-Time:       `{n}`
-Status:     {"● Active — trade your system" if active else "◯ Closed — wait for next session"}
-Next:       {get_next_session()}
-{DIVIDER}
-_London:_     `07:00 – 12:00 UTC`
-_New York:_   `12:00 – 17:00 UTC`
-"""
-
-
-def trade_log_message():
-    return f"""
-📓  *TRADE LOG — Search Reference*
-{DIVIDER}
-All logs are saved as messages in this chat.
-Search by hashtag in Telegram:
-
-▫️  *All logs:*       `#log`
-▫️  *Gold only:*      `#gold`
-▫️  *Active zones:*   `#zone #active`
-▫️  *Closed zones:*   `#zone #closed`
-▫️  *Signals:*        `#signal`
-▫️  *London only:*    `#london`
-▫️  *NY only:*        `#newyork`
-
-{DIVIDER}
-_Every signal and zone is auto-logged._
-"""
-
-
-def status_message():
-    """Detailed bot status for Monday troubleshooting."""
-    def fmt_time(t):
-        if not t:
-            return "_never_"
-        if isinstance(t, str):
-            return f"`{t[11:16]} UTC` ({t[:10]})"
-        return f"`{t.strftime('%H:%M UTC')}` ({t.strftime('%Y-%m-%d')})"
-
-    last_scan = fmt_time(LAST_SCAN_TIME)
-    last_2h   = fmt_time(LAST_2H_SCAN_TIME)
-    last_15m  = fmt_time(LAST_15M_SCAN_TIME)
-
-    dxy_line = "_no DXY check yet_"
-    if LAST_DXY_CHECK:
-        dxy_line = f"{LAST_DXY_CHECK['trend']} ▪︎ price `{LAST_DXY_CHECK.get('price', 'n/a')}` ▪︎ {fmt_time(LAST_DXY_CHECK['time'])}"
-
-    error_line = "_none_"
-    if LAST_ERROR:
-        error_line = f"`{LAST_ERROR['where']}` ▪︎ {fmt_time(LAST_ERROR['time'])}\n_{LAST_ERROR['message']}_"
-
-    zones_line = f"`{len(ACTIVE_ZONES)}` active ▪︎ `{len(PENDING_ZONES)}` pending"
-
-    proposed_line = f"`{len(PROPOSED_BOS_LEVELS)}` BOS levels seen this session"
-
-    winddown_line = "🔔 *Friday wind-down ACTIVE*" if is_friday_winddown() else ""
-
-    return f"""
-☑  *BOT STATUS*  ▪︎  v2.0
-{DIVIDER}
-*Session:*       {get_session_label()}
-*Active:*        {"Yes" if is_session_active() else "No"}
-{winddown_line}
-{DIVIDER}
-*Last scan:*     {last_scan}
-*Last 2H pull:*  {last_2h}
-*Last 15M pull:* {last_15m}
-*DXY:*           {dxy_line}
-{DIVIDER}
-*Zones:*         {zones_line}
-*Memory:*        {proposed_line}
-{DIVIDER}
-*Today's counts:*
-  Alerts sent:   `{ALERTS_SENT_TODAY}`
-  Signals fired: `{SIGNALS_SENT_TODAY}`
-{DIVIDER}
-*Last error:*
-{error_line}
-{DIVIDER}
-"""
-
-
-def config_message():
-    """Show current strategy parameters (read-only)."""
-    return f"""
-⚙️  *BOT CONFIG*  (read-only)
-{DIVIDER}
-*Strategy:*
-  Swing lookback:        `{SWING_LOOKBACK}` bars
-  ATR period:            `{ATR_PERIOD}`
-  ATR significance:      `{ATR_SIGNIFICANCE}` × ATR
-  Consolidation ratio:   `{CONSOLIDATION_RATIO}` × ATR
-  Min RR:                `{MIN_RR}`
-  Risk per trade:        `{RISK_PERCENT}%`
-
-*Proximity:*
-  Approaching threshold: `{APPROACH_ATR}` × ATR
-  Near threshold:        `{NEAR_ATR}` × ATR
-
-*15M trigger:*
-  LTF swing lookback:    `{LTF_SWING_LOOKBACK}`
-
-*Sessions (UTC):*
-  London:                `{LONDON_OPEN}:00 – {LONDON_CLOSE}:00`
-  New York:              `{NY_OPEN}:00 – {NY_CLOSE}:00`
-  Friday wind-down:      `{FRIDAY_WINDDOWN_HOUR}:00`
-
-*Caps:*
-  Max active zones:      `{MAX_ACTIVE_ZONES}`
-{DIVIDER}
-_To change parameters, edit app.py and redeploy._
-"""
-
-
-def active_zones_message():
-    if not ACTIVE_ZONES:
-        return f"""
-*ACTIVE ZONES*
-{DIVIDER}
-_No active zones right now._
-The bot will mark new zones when it detects fresh 2H BOS during sessions.
-"""
-    lines = [f"*ACTIVE ZONES*  ({len(ACTIVE_ZONES)})", DIVIDER]
-    for z in ACTIVE_ZONES:
-        arrow = "▲" if z["direction"] == "bullish" else "▼"
-        fvg_str = f" + FVG `{round(z['fvg_low'],2)}-{round(z['fvg_high'],2)}`" if z["fvg_high"] else ""
-        lines.append(f"{arrow}  *{z['direction'].upper()}* zone  ▪︎  `{round(z['zone_low'],2)} – {round(z['zone_high'],2)}`")
-        lines.append(f"    State: `{z['state']}`{fvg_str}")
-        lines.append(f"    Created: `{z['created_at'][11:16]} UTC`")
-    lines.append(DIVIDER)
+# =============================================================================
+# TELEGRAM
+# =============================================================================
+bot: Optional[Bot] = None
+
+
+def fmt_price(p: Optional[float]) -> str:
+    if p is None:
+        return "—"
+    return f"{p:.2f}"
+
+
+def build_signal_message(trade: Dict) -> str:
+    g = trade["grading"]
+    direction_emoji = "🟢 BUY" if trade["direction"] == "bullish" else "🔴 SELL"
+    grade_emoji = {"A+": "🏆", "A": "⭐", "B": "📊", "C": "⚠️"}[g["grade"]]
+    risk_amt = ACCOUNT_SIZE * g["risk_pct"]
+
+    factor_lines = "\n".join(f"  {sym} {txt}" for sym, txt in g["factors"])
+
+    lines = [
+        f"{grade_emoji} <b>SIGNAL · {INSTRUMENT_DISPLAY} · {direction_emoji} · {g['grade']}</b>",
+        f"#signal #{trade['direction']} #{g['grade'].replace('+', 'plus').lower()}",
+        "",
+        f"<b>Grade:</b> {g['grade']} ({g['score']}/6)",
+        factor_lines,
+        "",
+        f"<b>Entry (limit at OB):</b> {fmt_price(trade['entry'])}",
+        f"<b>Stop Loss:</b> {fmt_price(trade['sl'])}",
+        f"<b>TP1 (3R):</b> {fmt_price(trade['tp1'])}",
+        f"<b>TP2 (2H swing):</b> {fmt_price(trade.get('tp2'))}",
+        "",
+        f"<b>Risk:</b> {g['risk_pct']*100:.2f}%  (~${risk_amt:.2f} on ${ACCOUNT_SIZE:.0f})",
+        f"<b>Expires:</b> {SIGNAL_EXPIRY_BARS} bars (no fill = canceled)",
+        "",
+        f"<i>Trade ID: {trade['id']}</i>",
+    ]
     return "\n".join(lines)
 
 
-def format_structure_card(structure):
-    trend_icon = {"Bullish": "▲", "Bearish": "▼", "Ranging": "◆"}.get(structure["trend"], "◆")
-    consolidation_note = ""
-    if structure["consolidating"]:
-        consolidation_note = "\n⚠  *Consolidating range* — wait for breakout"
+def build_addon_message(trade: Dict, parent_id: str, parent_entry: float) -> str:
+    g = trade["grading"]
+    direction_emoji = "🟢 BUY" if trade["direction"] == "bullish" else "🔴 SELL"
+    risk_amt = ACCOUNT_SIZE * g["risk_pct"]
+    factor_lines = "\n".join(f"  {sym} {txt}" for sym, txt in g["factors"])
 
-    swing_h = structure["last_swing_high"]
-    swing_l = structure["last_swing_low"]
-    swing_str = ""
-    if swing_h and swing_l:
-        swing_str = f"\nSwings:     ▲ `{swing_h}`  ▼ `{swing_l}`"
-
-    atr_str = f"\nATR(14):    `{structure['atr']}`" if structure["atr"] else ""
-
-    return f"""
-🪙  *GOLD — 2H Structure*
-{DIVIDER}
-Price:      `{structure['current_price']}`
-Trend:      {trend_icon}  {structure['trend']}
-BOS:        {structure['bos']}
-CHoCH:      {structure['choch']}{swing_str}{atr_str}
-Session:    {get_session_label()}{consolidation_note}
-{DIVIDER}
-"""
-
-
-def format_zone_proposal(zone):
-    """The message that asks user to validate a freshly marked zone."""
-    direction = zone["direction"]
-    arrow = "▲" if direction == "bullish" else "▼"
-    fvg_str = ""
-    if zone["fvg_high"] is not None:
-        fvg_str = f"\nFVG:        `{round(zone['fvg_low'],2)} – {round(zone['fvg_high'],2)}`"
-
-    return f"""
-🔔  *NEW ZONE DETECTED — GOLD*
-{DIVIDER}
-Direction:  {arrow}  *{direction.upper()}*
-OB:         `{round(zone['ob_low'],2)} – {round(zone['ob_high'],2)}`{fvg_str}
-Total zone: `{round(zone['zone_low'],2)} – {round(zone['zone_high'],2)}`
-2H BOS at:  `{round(zone['bos_level'],2)}`
-
-{DIVIDER}
-Verify on chart and confirm:
-"""
+    lines = [
+        f"➕ <b>ADD-ON · {INSTRUMENT_DISPLAY} · {direction_emoji} · {g['grade']}</b>",
+        f"#addon #{trade['direction']} #{g['grade'].replace('+', 'plus').lower()}",
+        "",
+        f"<b>Same direction as Trade <code>{parent_id}</code> (still active)</b>",
+        f"⚠️ Reminder: if taken, <b>move Trade {parent_id} SL to BE at {fmt_price(parent_entry)}</b>",
+        "",
+        f"<b>Grade:</b> {g['grade']} ({g['score']}/6)",
+        factor_lines,
+        "",
+        f"<b>Entry:</b> {fmt_price(trade['entry'])}",
+        f"<b>Stop Loss:</b> {fmt_price(trade['sl'])}",
+        f"<b>TP1 (3R):</b> {fmt_price(trade['tp1'])}",
+        f"<b>TP2 (2H swing):</b> {fmt_price(trade.get('tp2'))}",
+        "",
+        f"<b>Risk:</b> {g['risk_pct']*100:.2f}%  (~${risk_amt:.2f})",
+        f"<i>Trade ID: {trade['id']}</i>",
+    ]
+    return "\n".join(lines)
 
 
-def format_proximity_alert(zone, state, current_price, dxy):
-    arrow = "▲" if zone["direction"] == "bullish" else "▼"
-    state_emoji = {
-        "APPROACHING": "⚪",
-        "NEAR":        "🟡",
-        "TAPPED":      "🟧",
-    }.get(state, "▫️")
-
-    dxy_line = ""
-    if dxy and dxy["trend"] != "UNAVAILABLE":
-        dxy_aligned = (
-            (zone["direction"] == "bullish" and dxy["trend"] == "BEARISH") or
-            (zone["direction"] == "bearish" and dxy["trend"] == "BULLISH")
-        )
-        check = "✓" if dxy_aligned else "✗"
-        dxy_line = f"\nDXY:        {dxy['trend']}  {check}"
-
-    return f"""
-{state_emoji}  *ZONE {state} — GOLD*
-{DIVIDER}
-Direction:  {arrow}  {zone['direction'].upper()}
-Zone:       `{round(zone['zone_low'],2)} – {round(zone['zone_high'],2)}`
-Price:      `{round(current_price,2)}`{dxy_line}
-
-_Watching 15M for BOS/CHoCH..._
-{DIVIDER}
-"""
+def build_buttons(trade_id: str) -> InlineKeyboardMarkup:
+    keyboard = [[
+        InlineKeyboardButton("✅ Taken", callback_data=f"taken_{trade_id}"),
+        InlineKeyboardButton("⏭️ Skipped", callback_data=f"skipped_{trade_id}"),
+    ]]
+    return InlineKeyboardMarkup(keyboard)
 
 
-def format_signal(zone, levels, trigger, dxy, current_price):
-    arrow = "▲" if zone["direction"] == "bullish" else "▼"
-    side = "🟢 BUY" if zone["direction"] == "bullish" else "🔴 SELL"
-
-    dxy_line = "DXY:        UNAVAILABLE"
-    dxy_aligned = False
-    if dxy and dxy["trend"] != "UNAVAILABLE":
-        dxy_aligned = (
-            (zone["direction"] == "bullish" and dxy["trend"] == "BEARISH") or
-            (zone["direction"] == "bearish" and dxy["trend"] == "BULLISH")
-        )
-        check = "✓" if dxy_aligned else "✗ ⚠"
-        dxy_line = f"DXY:        {dxy['trend']}  {check}"
-
-    return f"""
-🔔  *A+ SIGNAL FIRED — GOLD*
-{DIVIDER}
-{side}  {arrow}  *{zone['direction'].upper()}*
-
-Entry:      `{levels['entry']}`
-SL:         `{levels['sl']}`
-TP:         `{levels['tp']}`
-Risk:       `{levels['risk']}` pts
-RR:         `1:{levels['rr']}`
-{DIVIDER}
-*Trigger:* {trigger['type']}
-*Zone:* `{round(zone['zone_low'],2)} – {round(zone['zone_high'],2)}`
-*Price now:* `{round(current_price,2)}`
-{dxy_line}
-Session:    {get_session_label()}
-{DIVIDER}
-⚠ _Always confirm on TradingView before execution._
-_Risk 0.5% — verify spread and slippage._
-
-#signal #gold #{zone['direction']} #log
-"""
-
-
-def format_zone_log(zone, status):
-    """Permanent Telegram log entry for a zone (Valid / Closed)."""
-    arrow = "▲" if zone["direction"] == "bullish" else "▼"
-    fvg_str = ""
-    if zone["fvg_high"] is not None:
-        fvg_str = f"\nFVG: `{round(zone['fvg_low'],2)}-{round(zone['fvg_high'],2)}`"
-    return f"""
-🎯  *ZONE {status.upper()} — GOLD*
-{DIVIDER}
-{arrow}  {zone['direction'].upper()}
-OB: `{round(zone['ob_low'],2)} – {round(zone['ob_high'],2)}`{fvg_str}
-Created: `{zone['created_at'][:16]} UTC`
-
-#zone #gold #{zone['direction']} #{status.lower()} #log
-"""
-
-
-# ─────────────────────────────────────────────────────────────
-# CORE ANALYSIS FLOW (manual trigger)
-# ─────────────────────────────────────────────────────────────
-def run_gold_analysis():
-    """Manual analysis triggered by Force Scan or analyze_gold button."""
-    global LAST_SCAN_TIME
-
-    if not is_session_active():
-        return False, {
-            "headline": "◯  *Market Closed*",
-            "body": f"Gold analysis only runs during London or NY sessions.\n\n_{get_next_session()}_",
-        }
-
-    candles_2h = get_2h_data(bars=30)
-    if not candles_2h:
-        return False, {
-            "headline": "⚠  *Data Unavailable*",
-            "body": "Could not fetch gold 2H data. Try again in a moment.",
-        }
-
-    structure = analyze_structure(candles_2h)
-    if structure is None:
-        return False, {
-            "headline": "⚠  *Structure Analysis Failed*",
-            "body": "Insufficient data on 2H. Try again later.",
-        }
-
-    LAST_SCAN_TIME = now_utc()
-    card = format_structure_card(structure)
-    return True, {"headline": None, "body": card, "structure": structure}
-
-
-# ─────────────────────────────────────────────────────────────
-# AUTO-SCAN — Proactive Engine
-# ─────────────────────────────────────────────────────────────
-def auto_market_scan():
-    """
-    Runs on each UptimeRobot ping (~5 min).
-    The proactive brain of the bot.
-    Hardened in Session 4 with: error handling, BOS dedup,
-    zone freshness checks, Friday wind-down, observability.
-    """
-    global LAST_SCAN_TIME, LAST_2H_BOS_LEVEL, LAST_2H_BOS_DIRECTION
-    global LAST_SESSION_OPEN_NOTIFIED, LAST_FRIDAY_WINDDOWN
-    global ALERTS_SENT_TODAY, SIGNALS_SENT_TODAY
-
-    if not is_session_active():
+def send_telegram(text: str, buttons: Optional[InlineKeyboardMarkup] = None):
+    """Synchronous Telegram send (uses HTTP API directly for reliability)."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram creds missing — would have sent:\n" + text[:200])
         return
-    if not CHAT_ID:
-        return
-
-    reset_daily_counters_if_needed()
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if buttons:
+        payload["reply_markup"] = json.dumps({
+            "inline_keyboard": [
+                [{"text": btn.text, "callback_data": btn.callback_data}
+                 for btn in row]
+                for row in buttons.inline_keyboard
+            ]
+        })
     try:
-        n = now_utc()
-        today = n.strftime("%Y-%m-%d")
+        r = requests.post(url, json=payload, timeout=10)
+        if not r.ok:
+            log.error(f"Telegram send failed: {r.status_code} {r.text}")
+    except Exception as e:
+        log.error(f"Telegram send error: {e}")
 
-        # ── Step 1: Session-open notification (once per session per day)
-        session_key = None
-        if n.hour == LONDON_OPEN and n.minute < 10:
-            session_key = f"{today}-london"
-        elif n.hour == NY_OPEN and n.minute < 10:
-            session_key = f"{today}-newyork"
 
-        if session_key and session_key != LAST_SESSION_OPEN_NOTIFIED:
-            LAST_SESSION_OPEN_NOTIFIED = session_key
-            label = "London" if "london" in session_key else "New York"
-            send_telegram(
-                CHAT_ID,
-                f"🔔  *{label} session open*\n{DIVIDER}\nGold bot is active — watching for setups.\n#log #{label.lower().replace(' ','')}",
-            )
-            ALERTS_SENT_TODAY += 1
+# =============================================================================
+# SIGNAL GENERATION
+# =============================================================================
+def make_trade_id(bos_candle_time: str, direction: str) -> str:
+    """Deterministic ID from BOS candle so duplicate scans don't re-fire."""
+    # Normalize: drop spaces/colons
+    clean = bos_candle_time.replace(" ", "_").replace(":", "").replace("-", "")
+    return f"{clean}_{direction[0]}"
 
-        # ── Step 1b: Friday wind-down (once per Friday)
-        friday_key = today if is_friday_winddown() else None
-        if friday_key and friday_key != LAST_FRIDAY_WINDDOWN:
-            LAST_FRIDAY_WINDDOWN = friday_key
-            # Clear all active zones
-            cleared = len(ACTIVE_ZONES)
-            ACTIVE_ZONES.clear()
-            PROPOSED_BOS_LEVELS.clear()
-            send_telegram(
-                CHAT_ID,
-                f"🔔  *Friday wind-down*\n{DIVIDER}\nNo new signals after 15:00 UTC Friday.\nCleared `{cleared}` active zone(s).\nMarkets resume Monday London open.\n#log #friday",
-            )
-            ALERTS_SENT_TODAY += 1
-            return  # nothing else to do after winddown
 
-        # ── Step 2: Pull 2H structure
-        candles_2h = get_2h_data(bars=30)
-        if not candles_2h:
-            log_error("auto_scan", "no 2H data")
-            return
-        structure = analyze_structure(candles_2h)
-        if not structure:
-            log_error("auto_scan", "no 2H structure")
-            return
+def trade_id_exists(trade_id: str) -> bool:
+    for t in state["active_trades"]:
+        if t["id"] == trade_id:
+            return True
+    for t in state["completed_trades"]:
+        if t["id"] == trade_id:
+            return True
+    return False
 
-        LAST_SCAN_TIME = now_utc()
-        current_price = structure["current_price"]
-        atr = structure["atr_raw"]
 
-        # ── Step 3: Skip everything if consolidating
-        if structure["consolidating"]:
-            return
+def create_trade(direction: str, bos: Dict, ob: Dict, fvg: Optional[Dict],
+                 grading: Dict, levels: Dict, tp2: Optional[float],
+                 is_addon: bool = False, parent_id: Optional[str] = None) -> Dict:
+    trade_id = make_trade_id(bos["bos_candle"]["time"], direction)
+    return {
+        "id": trade_id,
+        "direction": direction,
+        "state": "PENDING",
+        "entry": levels["entry"],
+        "sl": levels["sl"],
+        "tp1": levels["tp1"],
+        "tp2": tp2,
+        "risk": levels["risk"],
+        "ob_high": ob["high"],
+        "ob_low": ob["low"],
+        "ob_open": ob["open"],
+        "fvg": fvg,
+        "grading": grading,
+        "bos_time": bos["bos_candle"]["time"],
+        "fired_at": datetime.now(timezone.utc).isoformat(),
+        "tapped_at": None,
+        "closed_at": None,
+        "outcome": None,
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "expiry_bars_left": SIGNAL_EXPIRY_BARS,
+        "user_decision": None,  # taken / skipped / null
+        "is_addon": is_addon,
+        "parent_trade_id": parent_id,
+    }
 
-        # ── Step 4: Direction-flip detection
-        # If 2H direction has flipped (bullish trend turned bearish or vice
-        # versa), reset the proposed BOS memory so we can propose new zones.
-        if (structure["bos_direction"] and
-                LAST_2H_BOS_DIRECTION and
-                structure["bos_direction"] != LAST_2H_BOS_DIRECTION):
-            PROPOSED_BOS_LEVELS.clear()
 
-        # ── Step 5: Detect fresh 2H BOS we haven't proposed yet
-        if (not is_friday_winddown() and
-                structure["bos_level"] is not None and
-                structure["bos_index"] is not None):
+# =============================================================================
+# LIFECYCLE: monitor PENDING and ACTIVE trades
+# =============================================================================
+def update_trade_lifecycle(candles_15m: List[Dict]):
+    """For each active trade, check if price hit entry/SL/TPs on latest candles."""
+    if not candles_15m:
+        return
+    latest = candles_15m[-1]
+    high = latest["high"]
+    low = latest["low"]
 
-            bos_key = (structure["bos_direction"], round(structure["bos_level"], 2))
+    still_active = []
+    for t in state["active_trades"]:
+        evt = None
 
-            if bos_key not in PROPOSED_BOS_LEVELS:
-                # Fresh BOS — find OB and FVG
-                ob = detect_order_block(
-                    structure["candles"],
-                    structure["bos_index"],
-                    structure["bos_direction"],
-                )
-                if ob:
-                    fvg = detect_fvg_in_impulse(
-                        structure["candles"],
-                        ob["index"],
-                        structure["bos_index"],
-                        structure["bos_direction"],
-                    )
-                    zone = make_zone(
-                        structure["bos_direction"],
-                        ob,
-                        fvg,
-                        structure["bos_level"],
-                    )
-
-                    # Freshness check (JP's rule):
-                    # Has price already tapped the zone, OR has new structure
-                    # formed beyond it? If yes -> setup is dead, skip it.
-                    candles_after_bos = structure["candles"][structure["bos_index"] + 1:]
-                    if is_zone_already_invalid(zone, candles_after_bos):
-                        # Mark as proposed so we don't re-check it endlessly
-                        PROPOSED_BOS_LEVELS.add(bos_key)
-                    else:
-                        PENDING_ZONES[zone["id"]] = zone
-                        PROPOSED_BOS_LEVELS.add(bos_key)
-                        LAST_2H_BOS_LEVEL = structure["bos_level"]
-                        LAST_2H_BOS_DIRECTION = structure["bos_direction"]
-
-                        # Send zone proposal to user
-                        send_telegram(
-                            CHAT_ID,
-                            format_zone_proposal(zone),
-                            zone_validation_buttons(zone["id"]),
-                        )
-                        ALERTS_SENT_TODAY += 1
-
-        # ── Step 6: Track active zones (proximity + 15M trigger)
-        dxy = None  # fetch lazily only when needed
-
-        for zone in list(ACTIVE_ZONES):
-            try:
-                state = proximity_state(current_price, zone, atr)
-            except Exception as e:
-                log_error("proximity_state", str(e))
-                continue
-
-            # Handle invalidation
-            if state == "INVALIDATED":
+        # PENDING: waiting for limit to tap
+        if t["state"] == "PENDING":
+            # Decrement expiry
+            t["expiry_bars_left"] -= 1
+            if t["expiry_bars_left"] <= 0:
+                t["state"] = "EXPIRED"
+                t["closed_at"] = datetime.now(timezone.utc).isoformat()
+                t["outcome"] = "EXPIRED"
                 send_telegram(
-                    CHAT_ID,
-                    f"✗  *Zone invalidated*\n{DIVIDER}\n{zone['direction'].upper()} zone `{round(zone['zone_low'],2)}-{round(zone['zone_high'],2)}` — price closed beyond it without trigger.\n\n#zone #gold #closed #invalidated #log",
-                )
-                remove_zone(zone["id"])
-                ALERTS_SENT_TODAY += 1
+                    f"⌛ <b>EXPIRED · {INSTRUMENT_DISPLAY}</b>\n#expired\n\n"
+                    f"Trade <code>{t['id']}</code> never tapped entry "
+                    f"({fmt_price(t['entry'])}). Removed from watch.")
+                state["completed_trades"].append(t)
                 continue
 
-            # Send proximity alerts (each state once per zone)
-            if state in ("APPROACHING", "NEAR", "TAPPED") and state not in zone["alerts_sent"]:
-                zone["alerts_sent"].append(state)
-                zone["state"] = state
+            # Did price reach the OB?
+            if t["direction"] == "bullish" and low <= t["entry"]:
+                t["state"] = "ACTIVE"
+                t["tapped_at"] = datetime.now(timezone.utc).isoformat()
+                evt = "tapped"
+            elif t["direction"] == "bearish" and high >= t["entry"]:
+                t["state"] = "ACTIVE"
+                t["tapped_at"] = datetime.now(timezone.utc).isoformat()
+                evt = "tapped"
 
-                if dxy is None:
-                    dxy = get_dxy_summary()
+            if evt == "tapped":
+                send_telegram(
+                    f"📍 <b>TAPPED · {INSTRUMENT_DISPLAY}</b>\n"
+                    f"#tapped #{t['direction']}\n\n"
+                    f"Trade <code>{t['id']}</code> is now LIVE.\n"
+                    f"Entry: {fmt_price(t['entry'])} · "
+                    f"SL: {fmt_price(t['sl'])} · "
+                    f"TP1: {fmt_price(t['tp1'])}")
 
-                send_telegram(CHAT_ID, format_proximity_alert(zone, state, current_price, dxy))
-                ALERTS_SENT_TODAY += 1
+        # ACTIVE: watch for SL, TP1, TP2
+        if t["state"] == "ACTIVE":
+            hit_sl = (t["direction"] == "bullish" and low <= t["sl"]) or \
+                     (t["direction"] == "bearish" and high >= t["sl"])
+            hit_tp1 = (not t["tp1_hit"]) and \
+                      ((t["direction"] == "bullish" and high >= t["tp1"]) or
+                       (t["direction"] == "bearish" and low <= t["tp1"]))
+            hit_tp2 = (not t["tp2_hit"]) and t.get("tp2") is not None and \
+                      ((t["direction"] == "bullish" and high >= t["tp2"]) or
+                       (t["direction"] == "bearish" and low <= t["tp2"]))
 
-            # Check 15M trigger when zone is at least APPROACHING.
-            # Skip during Friday wind-down.
-            if state in ("APPROACHING", "NEAR", "TAPPED") and not is_friday_winddown():
-                # Don't fire same trigger twice (track via zone state)
-                if "SIGNAL_FIRED" in zone["alerts_sent"]:
-                    continue
+            if hit_sl:
+                t["state"] = "SL_HIT"
+                t["closed_at"] = datetime.now(timezone.utc).isoformat()
+                t["outcome"] = "LOSS"
+                send_telegram(
+                    f"🛑 <b>SL HIT · {INSTRUMENT_DISPLAY}</b>\n"
+                    f"#sl #loss #{t['direction']}\n\n"
+                    f"Trade <code>{t['id']}</code> stopped at {fmt_price(t['sl'])}.\n"
+                    f"Risk taken: {t['grading']['risk_pct']*100:.2f}%")
+                state["completed_trades"].append(t)
+                continue
 
-                try:
-                    trigger = check_15m_trigger(zone)
-                except Exception as e:
-                    log_error("check_15m_trigger", str(e))
-                    continue
+            if hit_tp1:
+                t["tp1_hit"] = True
+                send_telegram(
+                    f"💰 <b>TP1 HIT (3R) · {INSTRUMENT_DISPLAY}</b>\n"
+                    f"#tp1 #profit #{t['direction']}\n\n"
+                    f"Trade <code>{t['id']}</code> hit TP1 at {fmt_price(t['tp1'])}.\n"
+                    f"<b>Close partial. Move runner SL to BE: {fmt_price(t['entry'])}</b>"
+                    + (f"\nRunner targeting TP2: {fmt_price(t['tp2'])}"
+                       if t.get('tp2') else ""))
 
-                if trigger.get("fired"):
-                    levels = calculate_trade_levels(zone, current_price)
-                    if levels:
-                        if dxy is None:
-                            dxy = get_dxy_summary()
-                        send_telegram(CHAT_ID, format_signal(zone, levels, trigger, dxy, current_price))
-                        send_telegram(CHAT_ID, format_zone_log(zone, "fired"))
-                        zone["alerts_sent"].append("SIGNAL_FIRED")
-                        SIGNALS_SENT_TODAY += 1
-                        ALERTS_SENT_TODAY += 1
-                        remove_zone(zone["id"])
+            if hit_tp2:
+                t["tp2_hit"] = True
+                t["state"] = "TP2_HIT"
+                t["closed_at"] = datetime.now(timezone.utc).isoformat()
+                t["outcome"] = "WIN_FULL"
+                send_telegram(
+                    f"🏆 <b>TP2 HIT · {INSTRUMENT_DISPLAY}</b>\n"
+                    f"#tp2 #profit #{t['direction']}\n\n"
+                    f"Trade <code>{t['id']}</code> hit TP2 at {fmt_price(t['tp2'])}. "
+                    f"Full close.")
+                state["completed_trades"].append(t)
+                continue
+
+        still_active.append(t)
+
+    state["active_trades"] = still_active
+
+
+# =============================================================================
+# CORE SCANNER
+# =============================================================================
+def in_session() -> bool:
+    """True if current UTC hour is within London or NY session."""
+    h = datetime.now(timezone.utc).hour
+    return SESSION_START_UTC <= h < SESSION_END_UTC
+
+
+def scan():
+    """Single scan cycle. Called by scheduler every SCAN_INTERVAL_SECONDS."""
+    try:
+        if state.get("paused"):
+            return
+        state["last_scan_ts"] = datetime.now(timezone.utc).isoformat()
+        reset_daily_counter()
+
+        # Fetch candles regardless of session (lifecycle updates need them)
+        candles_15m = fetch_candles(TF_15M, CANDLES_15M)
+        if not candles_15m:
+            log.warning("scan: no 15M candles, abort")
+            return
+
+        # ALWAYS update lifecycle of existing trades, even off-session
+        update_trade_lifecycle(candles_15m)
+        save_state()
+
+        # New signal generation only during session
+        if not in_session():
+            return
+
+        candles_2h = fetch_candles(TF_2H, CANDLES_2H)
+        if not candles_2h:
+            log.warning("scan: no 2H candles, skip signal gen")
+            return
+
+        trend_2h = determine_trend(candles_2h)
+        state["last_2h_trend"] = trend_2h
+        swings_2h = detect_swings(candles_2h, lookback=SWING_LOOKBACK)
+
+        bos = detect_15m_break(candles_15m)
+        if not bos:
+            return
+
+        # Build trade ID early; skip if we've already fired on this BOS
+        trade_id = make_trade_id(bos["bos_candle"]["time"], bos["direction"])
+        if trade_id_exists(trade_id):
+            return
+
+        ob = find_order_block(candles_15m, bos)
+        if not ob:
+            log.info("scan: BOS found but no OB → skip")
+            return
+
+        fvg = find_fvg(candles_15m, bos, ob["idx"])
+        levels = compute_levels(bos["direction"], ob)
+        if levels["risk"] <= 0:
+            log.info("scan: invalid risk (entry == SL) → skip")
+            return
+        tp2 = find_tp2(bos["direction"], levels["entry"], levels["tp1"], swings_2h)
+        grading = grade_setup(bos["direction"], fvg, levels, trend_2h, swings_2h)
+
+        # Determine if this is an add-on
+        same_dir_active = [t for t in state["active_trades"]
+                           if t["direction"] == bos["direction"]
+                           and t["state"] in ("PENDING", "ACTIVE")]
+
+        if same_dir_active:
+            parent = same_dir_active[0]  # oldest same-direction
+            trade = create_trade(bos["direction"], bos, ob, fvg, grading, levels, tp2,
+                                 is_addon=True, parent_id=parent["id"])
+            state["active_trades"].append(trade)
+            state["signals_today"] += 1
+            send_telegram(
+                build_addon_message(trade, parent["id"], parent["entry"]),
+                buttons=build_buttons(trade["id"])
+            )
+            log.info(f"ADD-ON fired: {trade['id']} parent={parent['id']}")
+        else:
+            trade = create_trade(bos["direction"], bos, ob, fvg, grading, levels, tp2)
+            state["active_trades"].append(trade)
+            state["signals_today"] += 1
+            send_telegram(
+                build_signal_message(trade),
+                buttons=build_buttons(trade["id"])
+            )
+            log.info(f"SIGNAL fired: {trade['id']} grade={grading['grade']}")
+
+        save_state()
 
     except Exception as e:
-        log_error("auto_market_scan", str(e))
+        log.exception(f"scan() error: {e}")
 
 
-# ─────────────────────────────────────────────────────────────
-# FLASK ROUTES
-# ─────────────────────────────────────────────────────────────
-@app.route("/test_functions")
-def test_functions():
-    """
-    Smoke test endpoint — verifies all critical functions exist and are callable.
-    Hit this after every deploy. Healthy output means the build didn't lose
-    any function definitions during patching.
-    """
-    critical_funcs = [
-        "fetch_candles", "resample_1h_to_2h", "get_2h_data", "get_15m_data",
-        "get_dxy_summary", "compute_atr", "detect_swings", "is_consolidating",
-        "analyze_structure", "detect_order_block", "detect_fvg_in_impulse",
-        "make_zone", "is_zone_already_invalid", "proximity_state",
-        "add_active_zone", "remove_zone", "check_15m_trigger",
-        "calculate_trade_levels", "run_gold_analysis", "auto_market_scan",
+# =============================================================================
+# FRIDAY WIND-DOWN
+# =============================================================================
+def friday_wind_down():
+    """Cancel all PENDING signals at Friday 17:00 UTC. Active trades persist."""
+    now = datetime.now(timezone.utc)
+    if now.weekday() != 4:  # 4 = Friday
+        return
+    if now.hour != FRIDAY_CUTOFF_HOUR:
+        return
+    pending = [t for t in state["active_trades"] if t["state"] == "PENDING"]
+    if not pending:
+        return
+    for t in pending:
+        t["state"] = "EXPIRED"
+        t["closed_at"] = now.isoformat()
+        t["outcome"] = "FRIDAY_CUTOFF"
+        state["completed_trades"].append(t)
+    state["active_trades"] = [t for t in state["active_trades"]
+                              if t["state"] != "EXPIRED"]
+    active_remaining = [t for t in state["active_trades"] if t["state"] == "ACTIVE"]
+    msg = (f"🌙 <b>Friday Wind-Down (17:00 UTC)</b>\n#winddown\n\n"
+           f"Cleared {len(pending)} pending signal(s).")
+    if active_remaining:
+        msg += f"\n\n⚠️ {len(active_remaining)} ACTIVE trade(s) still live — "
+        msg += "consider closing manually before weekend gap risk."
+    send_telegram(msg)
+    save_state()
+    log.info(f"Friday wind-down: {len(pending)} pending cleared")
+
+
+# =============================================================================
+# TELEGRAM COMMAND HANDLERS
+# =============================================================================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "JP Gold Bot v3.0 — 15M Textbook SMC\n\n"
+        "Commands:\n"
+        "/status — diagnostics\n"
+        "/config — current parameters\n"
+        "/pause — pause scanning\n"
+        "/resume — resume scanning\n"
+        "/clear_trades — drop all active trades (use with care)\n"
+        "/test_functions — verify scanner end-to-end\n"
+        "/help — this message"
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    a = state["active_trades"]
+    pending = [t for t in a if t["state"] == "PENDING"]
+    active = [t for t in a if t["state"] == "ACTIVE"]
+    last_scan = state.get("last_scan_ts", "never")
+    trend = state.get("last_2h_trend", "?")
+
+    lines = [
+        f"<b>JP Gold Bot v3.0 — Status</b>",
+        "",
+        f"Paused: {'YES' if state.get('paused') else 'no'}",
+        f"In session: {'yes' if in_session() else 'no'} (UTC hour {datetime.now(timezone.utc).hour})",
+        f"Last 2H trend: {trend}",
+        f"Last scan: {last_scan}",
+        f"Signals today: {state.get('signals_today', 0)}",
+        f"Account size: ${ACCOUNT_SIZE:.0f}",
+        "",
+        f"<b>Active book:</b>",
+        f"  PENDING: {len(pending)}",
+        f"  ACTIVE (live): {len(active)}",
+        f"  Completed (history): {len(state['completed_trades'])}",
     ]
-    import sys
-    this_module = sys.modules[__name__]
-    results = {}
-    for name in critical_funcs:
-        f = getattr(this_module, name, None)
-        results[name] = "OK" if callable(f) else "MISSING"
-    all_ok = all(v == "OK" for v in results.values())
-    return {
-        "all_functions_ok": all_ok,
-        "missing": [k for k, v in results.items() if v == "MISSING"],
-        "checked": len(critical_funcs),
-        "version": "2.0-s4-fixed",
-    }, 200 if all_ok else 500
+    if pending:
+        lines.append("\n<b>Pending signals:</b>")
+        for t in pending[:5]:
+            lines.append(f"  {t['id']} · {t['direction'][:4]} · entry "
+                         f"{fmt_price(t['entry'])} · {t['grading']['grade']} · "
+                         f"{t['expiry_bars_left']} bars left")
+    if active:
+        lines.append("\n<b>Live trades:</b>")
+        for t in active[:5]:
+            tp_status = "TP1✓" if t["tp1_hit"] else "→TP1"
+            lines.append(f"  {t['id']} · {t['direction'][:4]} · entry "
+                         f"{fmt_price(t['entry'])} · {tp_status}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = [
+        "<b>Bot Config</b>",
+        f"Instrument: {INSTRUMENT_DISPLAY}",
+        f"Sessions: {SESSION_START_UTC:02d}:00 – {SESSION_END_UTC:02d}:00 UTC (London + NY)",
+        f"Friday wind-down: {FRIDAY_CUTOFF_HOUR:02d}:00 UTC",
+        f"Scan interval: {SCAN_INTERVAL_SECONDS}s",
+        f"Signal expiry: {SIGNAL_EXPIRY_BARS} × 15M bars",
+        f"SL buffer: ${SL_BUFFER_USD}",
+        f"Swing lookback: {SWING_LOOKBACK} bars",
+        "",
+        "<b>Grading thresholds</b>",
+        "  A+ = 5–6 pts · A = 4 pts · B = 3 pts · C = 0–2 pts",
+        "",
+        "<b>Risk per grade</b>",
+        "  A+/A: 0.50%  ·  B/C: 0.25%",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state["paused"] = True
+    save_state()
+    await update.message.reply_text("⏸ Bot paused. Lifecycle tracking continues; no new signals.")
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state["paused"] = False
+    save_state()
+    await update.message.reply_text("▶️ Bot resumed.")
+
+
+async def cmd_clear_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = len(state["active_trades"])
+    for t in state["active_trades"]:
+        t["state"] = "CLEARED"
+        t["closed_at"] = datetime.now(timezone.utc).isoformat()
+        t["outcome"] = "MANUAL_CLEAR"
+        state["completed_trades"].append(t)
+    state["active_trades"] = []
+    save_state()
+    await update.message.reply_text(f"🧹 Cleared {n} active trade(s).")
+
+
+async def cmd_test_functions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Full smoke test — fetches data, runs each step, reports pass/fail."""
+    results = []
+
+    # 1. Twelve Data fetch
+    c15 = fetch_candles(TF_15M, 50)
+    results.append(("Fetch 15M candles", c15 is not None and len(c15) > 0,
+                    f"{len(c15) if c15 else 0} bars"))
+
+    c2h = fetch_candles(TF_2H, 50)
+    results.append(("Fetch 2H candles", c2h is not None and len(c2h) > 0,
+                    f"{len(c2h) if c2h else 0} bars"))
+
+    # 2. Swing detection
+    if c15:
+        s15 = detect_swings(c15)
+        results.append(("15M swings", len(s15) > 0, f"{len(s15)} swings"))
+    if c2h:
+        s2h = detect_swings(c2h)
+        results.append(("2H swings", len(s2h) > 0, f"{len(s2h)} swings"))
+        trend = determine_trend(c2h)
+        results.append(("2H trend", True, trend))
+
+    # 3. Telegram reachable
+    results.append(("Telegram token set", bool(TELEGRAM_TOKEN), ""))
+    results.append(("Telegram chat set", bool(TELEGRAM_CHAT_ID), ""))
+
+    # 4. State persistence
+    save_state()
+    results.append(("State write", os.path.exists(STATE_FILE), STATE_FILE))
+
+    lines = ["<b>Test Functions</b>", ""]
+    for name, ok, extra in results:
+        sym = "✅" if ok else "❌"
+        lines.append(f"{sym} {name}" + (f" — {extra}" if extra else ""))
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Taken/Skipped button taps."""
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if "_" not in data:
+        return
+    action, trade_id = data.split("_", 1)
+    # Find the trade in active or completed
+    target = None
+    for t in state["active_trades"]:
+        if t["id"] == trade_id:
+            target = t
+            break
+    if target is None:
+        for t in state["completed_trades"]:
+            if t["id"] == trade_id:
+                target = t
+                break
+    if target is None:
+        await q.edit_message_reply_markup(reply_markup=None)
+        return
+    target["user_decision"] = action
+    save_state()
+    # Remove buttons after decision recorded
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=q.message.chat_id,
+            text=f"Recorded: <b>{action.upper()}</b> for trade <code>{trade_id}</code>",
+            parse_mode="HTML",
+            reply_to_message_id=q.message.message_id,
+        )
+    except Exception as e:
+        log.warning(f"callback_handler edit failed: {e}")
+
+
+# =============================================================================
+# FLASK APP
+# =============================================================================
+app = Flask(__name__)
 
 
 @app.route("/")
-def root():
-    auto_market_scan()
-    return "ok", 200
-
-
-@app.route("/health")
 def health():
-    return {
-        "status": "online",
-        "session_active": is_session_active(),
-        "session": get_session_label(),
-        "friday_winddown": is_friday_winddown(),
-        "last_scan": LAST_SCAN_TIME.isoformat() if LAST_SCAN_TIME else None,
-        "last_2h_scan": LAST_2H_SCAN_TIME.isoformat() if LAST_2H_SCAN_TIME else None,
-        "last_15m_scan": LAST_15M_SCAN_TIME.isoformat() if LAST_15M_SCAN_TIME else None,
-        "active_zones": len(ACTIVE_ZONES),
-        "pending_zones": len(PENDING_ZONES),
-        "proposed_bos_levels": len(PROPOSED_BOS_LEVELS),
-        "alerts_today": ALERTS_SENT_TODAY,
-        "signals_today": SIGNALS_SENT_TODAY,
-        "last_error": LAST_ERROR,
-        "version": "2.0-s4-fixed",
-    }, 200
+    return jsonify({
+        "status": "ok",
+        "bot": "JP Gold Bot v3.0",
+        "paused": state.get("paused", False),
+        "active_trades": len(state["active_trades"]),
+        "completed_trades": len(state["completed_trades"]),
+        "last_scan": state.get("last_scan_ts"),
+        "last_2h_trend": state.get("last_2h_trend"),
+        "in_session": in_session(),
+    })
 
 
-@app.route("/startup")
-def startup():
-    if CHAT_ID:
-        send_telegram(CHAT_ID, dashboard_message(), main_menu())
-    return "ok", 200
+@app.route("/test_functions")
+def test_functions_http():
+    """HTTP endpoint mirror of /test_functions for post-deploy ping."""
+    results = {}
+    c15 = fetch_candles(TF_15M, 50)
+    results["fetch_15m"] = bool(c15)
+    c2h = fetch_candles(TF_2H, 50)
+    results["fetch_2h"] = bool(c2h)
+    if c2h:
+        results["trend_2h"] = determine_trend(c2h)
+    results["telegram_creds"] = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+    results["state_file"] = os.path.exists(STATE_FILE)
+    return jsonify(results)
 
 
-# ── Webhook ────────────────────────────────────────────────────
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.json
-    if not data:
-        return "ok", 200
-
-    # ─── Inline button presses ──────────────────────────────
-    if "callback_query" in data:
-        cb = data["callback_query"]
-        chat_id = cb["message"]["chat"]["id"]
-        message_id = cb["message"]["message_id"]
-        action = cb["data"]
-        answer_callback(cb["id"])
-
-        if action == "dashboard":
-            send_telegram(chat_id, dashboard_message(), main_menu())
-
-        elif action == "session_info":
-            send_telegram(chat_id, session_status_message(), back_button())
-
-        elif action == "rules":
-            send_telegram(chat_id, rules_message(), back_button())
-
-        elif action == "checklist":
-            send_telegram(chat_id, checklist_message(), back_button())
-
-        elif action == "trade_log":
-            send_telegram(chat_id, trade_log_message(), back_button())
-
-        elif action == "active_zones":
-            send_telegram(chat_id, active_zones_message(), back_button())
-
-        elif action == "status":
-            send_telegram(chat_id, status_message(), back_button())
-
-        elif action in ("analyze_gold", "force_scan"):
-            label = "*Analyzing gold...*" if action == "analyze_gold" else "*Force scanning gold...*"
-            send_telegram(chat_id, label)
-            ok, result = run_gold_analysis()
-            if ok:
-                send_telegram(chat_id, result["body"], back_button())
-            else:
-                msg = f"{result['headline']}\n{DIVIDER}\n{result['body']}"
-                send_telegram(chat_id, msg, back_button())
-
-        # ── Zone validation buttons ──
-        elif action.startswith("valid_"):
-            zid = action[len("valid_"):]
-            zone = PENDING_ZONES.pop(zid, None)
-            if zone:
-                zone["state"] = "VALIDATED"
-                add_active_zone(zone)
-                edit_telegram(
-                    chat_id, message_id,
-                    f"✓  *Zone validated*  ▪︎  watching\n{DIVIDER}\n{zone['direction'].upper()} `{round(zone['zone_low'],2)}-{round(zone['zone_high'],2)}`",
-                )
-                send_telegram(chat_id, format_zone_log(zone, "active"))
-            else:
-                send_telegram(chat_id, "_Zone not found (may have expired)._", back_button())
-
-        elif action.startswith("poor_"):
-            zid = action[len("poor_"):]
-            zone = PENDING_ZONES.pop(zid, None)
-            if zone:
-                edit_telegram(
-                    chat_id, message_id,
-                    f"✗  *Zone discarded*\n{DIVIDER}\n_Bot will not track this one._",
-                )
-            else:
-                send_telegram(chat_id, "_Zone not found._", back_button())
-
-        elif action.startswith("edit_"):
-            zid = action[len("edit_"):]
-            zone = PENDING_ZONES.get(zid)
-            if zone:
-                EDIT_PROMPTS[chat_id] = zid
-                send_telegram(
-                    chat_id,
-                    f"✏️  *Edit zone*\n{DIVIDER}\nReply with corrected zone as:\n`high, low`\n\nExample: `4605.00, 4598.00`\n\n_Current: {round(zone['zone_high'],2)}, {round(zone['zone_low'],2)}_",
-                )
-
-    # ─── Text/photo messages ──────────────────────────────
-    if "message" in data:
-        msg = data["message"]
-        chat_id = msg["chat"]["id"]
-        text = msg.get("text", "")
-
-        # Check if user is responding to an edit prompt
-        if chat_id in EDIT_PROMPTS:
-            zid = EDIT_PROMPTS[chat_id]
-            zone = PENDING_ZONES.get(zid)
-            if zone:
-                try:
-                    parts = [p.strip() for p in text.replace(" ", "").split(",")]
-                    high = float(parts[0])
-                    low = float(parts[1])
-                    if high < low:
-                        high, low = low, high
-                    zone["zone_high"] = high
-                    zone["zone_low"]  = low
-                    zone["ob_high"]   = high
-                    zone["ob_low"]    = low
-                    zone["fvg_high"]  = None
-                    zone["fvg_low"]   = None
-                    zone["state"]     = "VALIDATED"
-                    PENDING_ZONES.pop(zid, None)
-                    add_active_zone(zone)
-                    EDIT_PROMPTS.pop(chat_id, None)
-                    send_telegram(
-                        chat_id,
-                        f"✓  *Zone updated and validated*\n{DIVIDER}\n{zone['direction'].upper()} `{round(low,2)}-{round(high,2)}` — watching",
-                        back_button(),
-                    )
-                    send_telegram(chat_id, format_zone_log(zone, "active"))
-                except (ValueError, IndexError):
-                    send_telegram(
-                        chat_id,
-                        f"_Invalid format. Send as `high, low` — e.g. `4605.00, 4598.00`_",
-                    )
-            return "ok", 200
-
-        # Regular commands
-        if text in ["/start", "/menu", "/dashboard"]:
-            send_telegram(chat_id, dashboard_message(), main_menu())
-        elif text == "/scan":
-            send_telegram(chat_id, "*Force scanning gold...*")
-            ok, result = run_gold_analysis()
-            if ok:
-                send_telegram(chat_id, result["body"], back_button())
-            else:
-                send_telegram(chat_id, f"{result['headline']}\n{DIVIDER}\n{result['body']}", back_button())
-        elif text == "/zones":
-            send_telegram(chat_id, active_zones_message(), back_button())
-        elif text == "/status":
-            send_telegram(chat_id, status_message(), back_button())
-        elif text == "/config":
-            send_telegram(chat_id, config_message(), back_button())
-        elif text == "/health":
-            send_telegram(
-                chat_id,
-                f"☑ *Bot Health*\n{DIVIDER}\nVersion: `2.0-s4-fixed`\nSession: {get_session_label()}\nActive zones: `{len(ACTIVE_ZONES)}`\n{heartbeat_line()}\n\n_For details, use_ `/status`",
-                back_button(),
-            )
-        elif text == "/rules":
-            send_telegram(chat_id, rules_message(), back_button())
-        elif text == "/checklist":
-            send_telegram(chat_id, checklist_message(), back_button())
-        else:
-            send_telegram(chat_id, "_Tap a button on the dashboard, or use_ `/menu`", back_button())
-
-    return "ok", 200
+# =============================================================================
+# STARTUP
+# =============================================================================
+def start_scheduler():
+    sched = BackgroundScheduler(timezone="UTC")
+    sched.add_job(scan, "interval", seconds=SCAN_INTERVAL_SECONDS, id="scan",
+                  max_instances=1, coalesce=True)
+    # Run Friday wind-down check every hour; the function itself gates by time
+    sched.add_job(friday_wind_down, "cron", minute=0, id="friday_wind_down")
+    sched.start()
+    log.info(f"Scheduler started: scan every {SCAN_INTERVAL_SECONDS}s")
 
 
-# ─────────────────────────────────────────────────────────────
-# ENTRYPOINT
-# ─────────────────────────────────────────────────────────────
+def start_telegram_polling():
+    """Start Telegram bot in a background thread (async-aware)."""
+    if not TELEGRAM_TOKEN:
+        log.warning("TELEGRAM_TOKEN missing — bot commands disabled")
+        return
+
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("config", cmd_config))
+    application.add_handler(CommandHandler("pause", cmd_pause))
+    application.add_handler(CommandHandler("resume", cmd_resume))
+    application.add_handler(CommandHandler("clear_trades", cmd_clear_trades))
+    application.add_handler(CommandHandler("test_functions", cmd_test_functions))
+    application.add_handler(CallbackQueryHandler(callback_handler))
+
+    import threading
+
+    def run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        application.run_polling(stop_signals=None, close_loop=False)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    log.info("Telegram polling started")
+
+
+load_state()
+start_scheduler()
+start_telegram_polling()
+
+# Startup ping
+try:
+    send_telegram(
+        "🟢 <b>JP Gold Bot v3.0 online</b>\n"
+        f"#startup\n\n"
+        f"15M textbook SMC strategy active.\n"
+        f"Instrument: {INSTRUMENT_DISPLAY}\n"
+        f"Sessions: {SESSION_START_UTC:02d}:00 – {SESSION_END_UTC:02d}:00 UTC\n"
+        f"Use /status to verify, /test_functions to smoke test."
+    )
+except Exception as e:
+    log.warning(f"Startup ping failed: {e}")
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(host="0.0.0.0", port=PORT)
