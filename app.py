@@ -1,6 +1,6 @@
 """
 =============================================================================
-JP GOLD BOT v3.0 — Textbook SMC on 15M
+JP GOLD BOT v3.1 — Textbook SMC on 15M
 =============================================================================
 Strategy:
   - 2H timeframe used ONLY for trend context (bullish/bearish/range)
@@ -169,6 +169,12 @@ def fetch_candles(timeframe: str, count: int) -> Optional[List[Dict]]:
                 "low": float(v["low"]),
                 "close": float(v["close"]),
             })
+        # v3.1 FIX: Twelve Data returns the currently-FORMING candle as the
+        # most recent value. Drop it. Every downstream function must only ever
+        # see fully CLOSED candles — otherwise BOS / tap / SL detection reads a
+        # half-formed bar whose high-low range corrupts everything.
+        if len(candles) > 1:
+            candles = candles[:-1]
         return candles
     except Exception as e:
         log.error(f"fetch_candles({timeframe}) failed: {e}")
@@ -213,10 +219,12 @@ def determine_trend(candles: List[Dict]) -> str:
 
 
 def detect_15m_break(candles: List[Dict]) -> Optional[Dict]:
-    """Detect BOS or CHoCH on most recent closed 15M candle."""
+    """Detect BOS or CHoCH on most recent CLOSED 15M candle.
+    NOTE: fetch_candles() already drops the forming candle, so candles[-1]
+    here is guaranteed to be a fully closed bar."""
     if len(candles) < SWING_LOOKBACK * 2 + 2:
         return None
-    # Last fully-closed candle is the one that just printed
+    # candles[-1] is the most recent CLOSED candle (forming bar already dropped)
     last_idx = len(candles) - 1
     last = candles[last_idx]
     # Detect swings up to (but not including) last candle
@@ -524,6 +532,15 @@ def create_trade(direction: str, bos: Dict, ob: Dict, fvg: Optional[Dict],
         "fvg": fvg,
         "grading": grading,
         "bos_time": bos["bos_candle"]["time"],
+        # v3.1: the candle that PRODUCED this signal. A trade may only tap on a
+        # candle strictly AFTER this one — never on the signal candle itself.
+        "signal_candle_time": bos["bos_candle"]["time"],
+        # v3.1: last closed-candle time we've already evaluated for this trade.
+        # Guarantees each candle is processed exactly once, in order.
+        "last_processed_candle_time": bos["bos_candle"]["time"],
+        # v3.1: the candle on which the trade tapped (set when ACTIVE). SL/TP may
+        # only register on a candle AFTER this one.
+        "tapped_candle_time": None,
         "fired_at": datetime.now(timezone.utc).isoformat(),
         "tapped_at": None,
         "closed_at": None,
@@ -540,99 +557,227 @@ def create_trade(direction: str, bos: Dict, ob: Dict, fvg: Optional[Dict],
 # =============================================================================
 # LIFECYCLE: monitor PENDING and ACTIVE trades
 # =============================================================================
+def _candle_taps_entry(candle: Dict, direction: str, entry: float) -> bool:
+    """Did this candle's range reach the limit entry?"""
+    if direction == "bullish":
+        return candle["low"] <= entry
+    return candle["high"] >= entry
+
+
+def _candle_hits(candle: Dict, direction: str, level: float, kind: str) -> bool:
+    """Did this candle reach an SL or TP level?
+    kind = 'sl' or 'tp'. For a bullish trade SL is below / TP is above."""
+    if direction == "bullish":
+        if kind == "sl":
+            return candle["low"] <= level
+        return candle["high"] >= level
+    else:
+        if kind == "sl":
+            return candle["high"] >= level
+        return candle["low"] <= level
+
+
+def _resolve_same_candle(candle: Dict, direction: str, sl: float,
+                         tp: float) -> str:
+    """When one candle's range spans BOTH SL and a TP, decide which came
+    first using the candle's open->close direction as a heuristic.
+
+    A bullish candle (close > open) most likely went down-then-up, so it
+    touched the lower level first. A bearish candle went up-then-down.
+    Returns 'sl', 'tp', or 'none'.
+    Conservative tie-break: if direction is ambiguous, favour SL (worst case).
+    """
+    hit_sl = _candle_hits(candle, direction, sl, "sl")
+    hit_tp = _candle_hits(candle, direction, tp, "tp")
+    if hit_sl and not hit_tp:
+        return "sl"
+    if hit_tp and not hit_sl:
+        return "tp"
+    if not hit_sl and not hit_tp:
+        return "none"
+    # Both hit in one candle — use candle body direction.
+    bullish_candle = candle["close"] > candle["open"]
+    bearish_candle = candle["close"] < candle["open"]
+    if direction == "bullish":
+        # SL is below entry, TP above. A bullish (up-closing) candle most
+        # likely dipped to SL first then rallied. A bearish candle rallied
+        # to TP first then fell.
+        if bullish_candle:
+            return "sl"
+        if bearish_candle:
+            return "tp"
+    else:
+        # Bearish trade: SL above, TP below. A bearish candle most likely
+        # spiked up to SL first then dropped. A bullish candle dropped to
+        # TP first then rose.
+        if bearish_candle:
+            return "sl"
+        if bullish_candle:
+            return "tp"
+    # Doji / ambiguous — conservative: assume SL first.
+    return "sl"
+
+
 def update_trade_lifecycle(candles_15m: List[Dict]):
-    """For each active trade, check if price hit entry/SL/TPs on latest candles."""
+    """v3.1: time-ordered, candle-sequenced lifecycle.
+
+    Key guarantees vs v3.0:
+      - Only CLOSED candles are evaluated (fetch_candles drops the forming bar).
+      - Each candle is processed exactly ONCE per trade, in chronological order.
+      - A trade can only TAP on a candle strictly AFTER its signal candle.
+      - A trade can only hit SL/TP on a candle strictly AFTER it tapped.
+      - If one candle spans both SL and TP, body direction resolves order.
+    This kills the "signal + tapped + SL in the same minute" cascade.
+    """
     if not candles_15m:
         return
-    latest = candles_15m[-1]
-    high = latest["high"]
-    low = latest["low"]
 
     still_active = []
     for t in state["active_trades"]:
-        evt = None
+        # Closed candles newer than the last one we processed for this trade.
+        new_candles = [c for c in candles_15m
+                       if c["time"] > t["last_processed_candle_time"]]
 
-        # PENDING: waiting for limit to tap
-        if t["state"] == "PENDING":
-            # Decrement expiry
-            t["expiry_bars_left"] -= 1
-            if t["expiry_bars_left"] <= 0:
-                t["state"] = "EXPIRED"
-                t["closed_at"] = datetime.now(timezone.utc).isoformat()
-                t["outcome"] = "EXPIRED"
-                send_telegram(
-                    f"⌛ <b>EXPIRED · {INSTRUMENT_DISPLAY}</b>\n#expired\n\n"
-                    f"Trade <code>{t['id']}</code> never tapped entry "
-                    f"({fmt_price(t['entry'])}). Removed from watch.")
-                state["completed_trades"].append(t)
+        terminal = False  # set True if trade reaches a closed state
+
+        for candle in new_candles:
+            ctime = candle["time"]
+
+            # ---- PENDING: waiting for the limit at the OB to tap ----
+            if t["state"] == "PENDING":
+                # A trade can never tap on its own signal candle, only later.
+                if ctime <= t["signal_candle_time"]:
+                    t["last_processed_candle_time"] = ctime
+                    continue
+
+                # Expiry: count each closed candle the signal sat unfilled.
+                t["expiry_bars_left"] -= 1
+
+                if _candle_taps_entry(candle, t["direction"], t["entry"]):
+                    t["state"] = "ACTIVE"
+                    t["tapped_at"] = datetime.now(timezone.utc).isoformat()
+                    t["tapped_candle_time"] = ctime
+                    t["last_processed_candle_time"] = ctime
+                    send_telegram(
+                        f"📍 <b>TAPPED · {INSTRUMENT_DISPLAY}</b>\n"
+                        f"#tapped #{t['direction']}\n\n"
+                        f"Trade <code>{t['id']}</code> is now LIVE.\n"
+                        f"Entry: {fmt_price(t['entry'])} · "
+                        f"SL: {fmt_price(t['sl'])} · "
+                        f"TP1: {fmt_price(t['tp1'])}")
+                    # IMPORTANT: do not also evaluate SL/TP on the SAME candle
+                    # that tapped. Management starts on the NEXT candle.
+                    continue
+
+                # Still pending — did it expire?
+                if t["expiry_bars_left"] <= 0:
+                    t["state"] = "EXPIRED"
+                    t["closed_at"] = datetime.now(timezone.utc).isoformat()
+                    t["outcome"] = "EXPIRED"
+                    t["last_processed_candle_time"] = ctime
+                    send_telegram(
+                        f"⌛ <b>EXPIRED · {INSTRUMENT_DISPLAY}</b>\n#expired\n\n"
+                        f"Trade <code>{t['id']}</code> never tapped entry "
+                        f"({fmt_price(t['entry'])}). Removed from watch.")
+                    state["completed_trades"].append(t)
+                    terminal = True
+                    break
+
+                t["last_processed_candle_time"] = ctime
                 continue
 
-            # Did price reach the OB?
-            if t["direction"] == "bullish" and low <= t["entry"]:
-                t["state"] = "ACTIVE"
-                t["tapped_at"] = datetime.now(timezone.utc).isoformat()
-                evt = "tapped"
-            elif t["direction"] == "bearish" and high >= t["entry"]:
-                t["state"] = "ACTIVE"
-                t["tapped_at"] = datetime.now(timezone.utc).isoformat()
-                evt = "tapped"
+            # ---- ACTIVE: manage SL / TP1 / TP2 ----
+            if t["state"] == "ACTIVE":
+                # Only candles strictly after the tap candle can close it.
+                if t["tapped_candle_time"] and ctime <= t["tapped_candle_time"]:
+                    t["last_processed_candle_time"] = ctime
+                    continue
 
-            if evt == "tapped":
-                send_telegram(
-                    f"📍 <b>TAPPED · {INSTRUMENT_DISPLAY}</b>\n"
-                    f"#tapped #{t['direction']}\n\n"
-                    f"Trade <code>{t['id']}</code> is now LIVE.\n"
-                    f"Entry: {fmt_price(t['entry'])} · "
-                    f"SL: {fmt_price(t['sl'])} · "
-                    f"TP1: {fmt_price(t['tp1'])}")
+                # Decide what this candle did. Check SL vs the relevant TP.
+                # Pre-TP1: SL vs TP1.  Post-TP1: SL(at BE) vs TP2.
+                if not t["tp1_hit"]:
+                    outcome = _resolve_same_candle(
+                        candle, t["direction"], t["sl"], t["tp1"])
+                    if outcome == "sl":
+                        t["state"] = "SL_HIT"
+                        t["closed_at"] = datetime.now(timezone.utc).isoformat()
+                        t["outcome"] = "LOSS"
+                        t["last_processed_candle_time"] = ctime
+                        send_telegram(
+                            f"🛑 <b>SL HIT · {INSTRUMENT_DISPLAY}</b>\n"
+                            f"#sl #loss #{t['direction']}\n\n"
+                            f"Trade <code>{t['id']}</code> stopped at "
+                            f"{fmt_price(t['sl'])}.\n"
+                            f"Risk taken: {t['grading']['risk_pct']*100:.2f}%")
+                        state["completed_trades"].append(t)
+                        terminal = True
+                        break
+                    elif outcome == "tp":
+                        t["tp1_hit"] = True
+                        send_telegram(
+                            f"💰 <b>TP1 HIT (3R) · {INSTRUMENT_DISPLAY}</b>\n"
+                            f"#tp1 #profit #{t['direction']}\n\n"
+                            f"Trade <code>{t['id']}</code> hit TP1 at "
+                            f"{fmt_price(t['tp1'])}.\n"
+                            f"<b>Close partial. Move runner SL to BE: "
+                            f"{fmt_price(t['entry'])}</b>"
+                            + (f"\nRunner targeting TP2: {fmt_price(t['tp2'])}"
+                               if t.get('tp2') else ""))
+                        # Runner SL is now break-even (the entry price).
+                        t["sl"] = t["entry"]
+                        if not t.get("tp2"):
+                            # No TP2 → close fully at TP1.
+                            t["state"] = "TP1_HIT"
+                            t["closed_at"] = \
+                                datetime.now(timezone.utc).isoformat()
+                            t["outcome"] = "WIN_TP1"
+                            t["last_processed_candle_time"] = ctime
+                            state["completed_trades"].append(t)
+                            terminal = True
+                            break
+                        t["last_processed_candle_time"] = ctime
+                        continue
+                    else:
+                        t["last_processed_candle_time"] = ctime
+                        continue
+                else:
+                    # Post-TP1: runner with SL at BE, targeting TP2.
+                    outcome = _resolve_same_candle(
+                        candle, t["direction"], t["sl"], t["tp2"])
+                    if outcome == "tp":
+                        t["tp2_hit"] = True
+                        t["state"] = "TP2_HIT"
+                        t["closed_at"] = datetime.now(timezone.utc).isoformat()
+                        t["outcome"] = "WIN_FULL"
+                        t["last_processed_candle_time"] = ctime
+                        send_telegram(
+                            f"🏆 <b>TP2 HIT · {INSTRUMENT_DISPLAY}</b>\n"
+                            f"#tp2 #profit #{t['direction']}\n\n"
+                            f"Trade <code>{t['id']}</code> hit TP2 at "
+                            f"{fmt_price(t['tp2'])}. Full close.")
+                        state["completed_trades"].append(t)
+                        terminal = True
+                        break
+                    elif outcome == "sl":
+                        # Runner stopped at break-even — scratch, not a loss.
+                        t["state"] = "BE_STOP"
+                        t["closed_at"] = datetime.now(timezone.utc).isoformat()
+                        t["outcome"] = "WIN_TP1_BE_RUNNER"
+                        t["last_processed_candle_time"] = ctime
+                        send_telegram(
+                            f"⚖️ <b>RUNNER STOPPED AT BE · {INSTRUMENT_DISPLAY}"
+                            f"</b>\n#breakeven #{t['direction']}\n\n"
+                            f"Trade <code>{t['id']}</code> runner closed at "
+                            f"break-even after TP1. Net result: +TP1 partial.")
+                        state["completed_trades"].append(t)
+                        terminal = True
+                        break
+                    else:
+                        t["last_processed_candle_time"] = ctime
+                        continue
 
-        # ACTIVE: watch for SL, TP1, TP2
-        if t["state"] == "ACTIVE":
-            hit_sl = (t["direction"] == "bullish" and low <= t["sl"]) or \
-                     (t["direction"] == "bearish" and high >= t["sl"])
-            hit_tp1 = (not t["tp1_hit"]) and \
-                      ((t["direction"] == "bullish" and high >= t["tp1"]) or
-                       (t["direction"] == "bearish" and low <= t["tp1"]))
-            hit_tp2 = (not t["tp2_hit"]) and t.get("tp2") is not None and \
-                      ((t["direction"] == "bullish" and high >= t["tp2"]) or
-                       (t["direction"] == "bearish" and low <= t["tp2"]))
-
-            if hit_sl:
-                t["state"] = "SL_HIT"
-                t["closed_at"] = datetime.now(timezone.utc).isoformat()
-                t["outcome"] = "LOSS"
-                send_telegram(
-                    f"🛑 <b>SL HIT · {INSTRUMENT_DISPLAY}</b>\n"
-                    f"#sl #loss #{t['direction']}\n\n"
-                    f"Trade <code>{t['id']}</code> stopped at {fmt_price(t['sl'])}.\n"
-                    f"Risk taken: {t['grading']['risk_pct']*100:.2f}%")
-                state["completed_trades"].append(t)
-                continue
-
-            if hit_tp1:
-                t["tp1_hit"] = True
-                send_telegram(
-                    f"💰 <b>TP1 HIT (3R) · {INSTRUMENT_DISPLAY}</b>\n"
-                    f"#tp1 #profit #{t['direction']}\n\n"
-                    f"Trade <code>{t['id']}</code> hit TP1 at {fmt_price(t['tp1'])}.\n"
-                    f"<b>Close partial. Move runner SL to BE: {fmt_price(t['entry'])}</b>"
-                    + (f"\nRunner targeting TP2: {fmt_price(t['tp2'])}"
-                       if t.get('tp2') else ""))
-
-            if hit_tp2:
-                t["tp2_hit"] = True
-                t["state"] = "TP2_HIT"
-                t["closed_at"] = datetime.now(timezone.utc).isoformat()
-                t["outcome"] = "WIN_FULL"
-                send_telegram(
-                    f"🏆 <b>TP2 HIT · {INSTRUMENT_DISPLAY}</b>\n"
-                    f"#tp2 #profit #{t['direction']}\n\n"
-                    f"Trade <code>{t['id']}</code> hit TP2 at {fmt_price(t['tp2'])}. "
-                    f"Full close.")
-                state["completed_trades"].append(t)
-                continue
-
-        still_active.append(t)
+        if not terminal:
+            still_active.append(t)
 
     state["active_trades"] = still_active
 
@@ -696,6 +841,18 @@ def scan():
         if levels["risk"] <= 0:
             log.info("scan: invalid risk (entry == SL) → skip")
             return
+
+        # v3.1 GUARD: if price has ALREADY traded through the OB invalidation
+        # (the SL level) on the BOS candle itself, the setup is dead on arrival
+        # — a limit there would tap and stop instantly. Skip it.
+        bos_candle = bos["bos_candle"]
+        if bos["direction"] == "bullish" and bos_candle["low"] <= levels["sl"]:
+            log.info("scan: OB already invalidated on BOS candle → skip")
+            return
+        if bos["direction"] == "bearish" and bos_candle["high"] >= levels["sl"]:
+            log.info("scan: OB already invalidated on BOS candle → skip")
+            return
+
         tp2 = find_tp2(bos["direction"], levels["entry"], levels["tp1"], swings_2h)
         grading = grade_setup(bos["direction"], fvg, levels, trend_2h, swings_2h)
 
@@ -767,7 +924,7 @@ def friday_wind_down():
 # =============================================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "JP Gold Bot v3.0 — 15M Textbook SMC\n\n"
+        "JP Gold Bot v3.1 — 15M Textbook SMC\n\n"
         "Commands:\n"
         "/status — diagnostics\n"
         "/config — current parameters\n"
@@ -791,7 +948,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trend = state.get("last_2h_trend", "?")
 
     lines = [
-        f"<b>JP Gold Bot v3.0 — Status</b>",
+        f"<b>JP Gold Bot v3.1 — Status</b>",
         "",
         f"Paused: {'YES' if state.get('paused') else 'no'}",
         f"In session: {'yes' if in_session() else 'no'} (UTC hour {datetime.now(timezone.utc).hour})",
@@ -951,7 +1108,7 @@ app = Flask(__name__)
 def health():
     return jsonify({
         "status": "ok",
-        "bot": "JP Gold Bot v3.0",
+        "bot": "JP Gold Bot v3.1",
         "paused": state.get("paused", False),
         "active_trades": len(state["active_trades"]),
         "completed_trades": len(state["completed_trades"]),
@@ -1025,7 +1182,7 @@ start_telegram_polling()
 # Startup ping
 try:
     send_telegram(
-        "🟢 <b>JP Gold Bot v3.0 online</b>\n"
+        "🟢 <b>JP Gold Bot v3.1 online</b>\n"
         f"#startup\n\n"
         f"15M textbook SMC strategy active.\n"
         f"Instrument: {INSTRUMENT_DISPLAY}\n"
