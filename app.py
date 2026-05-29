@@ -1,33 +1,27 @@
 """
 =============================================================================
-JP GOLD BOT v3.2 — Setup Detector (no trade tracking)
+JP GOLD BOT v3.2 — Setup Detector (automation-ready records)
 =============================================================================
-Philosophy:
-  This bot is NOT a trader and NOT a trade tracker. It is a SETUP DETECTOR.
-  Its single job: when a clean textbook SMC setup forms on the 15M chart,
-  draw it, log it, and show it. The human validates each image against
-  TradingView. We are training the detector's eye, not trading its output.
+This bot is a SETUP DETECTOR, not a trader. It detects clean textbook 15M SMC
+setups, draws them, logs them, and shows them. The human validates each against
+TradingView. We are training the detector's eye, not trading its output.
 
 Strategy (locked):
-  - 2H trend = CONTEXT ONLY (recorded in each signal, never filters anything)
-  - 15M detection, in this order:
-      1. A structure break (BOS) on the most recent closed candle
-      2. The impulse that broke structure MUST contain an FVG (mandatory)
-      3. Mark the Order Block (last opposing candle before the impulse)
-  - Entry = OB open.  Stop = OB invalidation (+buffer).  Target = 3R fixed.
+  - 2H trend = CONTEXT ONLY (recorded, never filters)
+  - 15M detection: BOS on latest closed candle -> Order Block -> MANDATORY FVG
+  - Entry = OB open. Stop = OB invalidation (+buffer). Target = 3R fixed.
   - NO 2H swing targets. NO grading filter. NO trade tracking. NO add-on logic.
-  - Every valid setup is sent once (deduped by order block). Human filters by eye.
+  - One signal per unique order block (deduped). Human filters by eye.
 
-Output per signal:
-  - Telegram text: direction, 2H trend (context), entry/stop/target, signal ID
-  - Annotated chart PNG: candles + OB box + grey dashed entry + red dashed stop
-    + blue dashed 3R target, with context burned into the image
+Records are AUTOMATION-READY: every signal carries the full field set, with
+MetaApi/outcome fields null until automation is live. A /signals endpoint
+exposes them (with CORS) for the JP Signals viewer app.
 
 Operations:
-  - XAUUSD only (symbol configurable via MT_SYMBOL for future broker use)
-  - Scans once per closed 15M candle (every 15 min)
-  - London + NY sessions (07:00-22:00 UTC)
-  - Commands: /start /help /status /config /recent /test_functions /pause /resume
+  - XAUUSDm (configurable via MT_SYMBOL)
+  - Scans once per closed 15M candle
+  - London + NY sessions fire by default; Asia optional (INCLUDE_ASIA)
+  - Session tagged on every signal regardless, for win-rate-by-session later
 =============================================================================
 """
 
@@ -43,9 +37,8 @@ from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
 import matplotlib
-matplotlib.use("Agg")  # headless rendering on Render
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from matplotlib.patches import Rectangle
 
 # =============================================================================
@@ -56,51 +49,54 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "")
 PORT = int(os.getenv("PORT", "10000"))
 
-INSTRUMENT_DISPLAY = os.getenv("MT_SYMBOL", "XAUUSD")
-INSTRUMENT_API = "XAU/USD"  # Twelve Data symbol
+INSTRUMENT_DISPLAY = os.getenv("MT_SYMBOL", "XAUUSDm")
+INSTRUMENT_API = "XAU/USD"
 
-# Sessions (UTC)
+# Sessions (UTC). London+NY fire by default; Asia optional.
 SESSION_START_UTC = 7
 SESSION_END_UTC = 22
+INCLUDE_ASIA = os.getenv("INCLUDE_ASIA", "false").lower() == "true"
+ASIA_START_UTC = 0
+ASIA_END_UTC = 7
+
+# Position-sizing intent for automation (percent of account risked per trade).
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))  # 0.1 - 1.0
 
 # Timeframes
 TF_2H = "2h"
 TF_15M = "15min"
 CANDLES_2H = 80
-CANDLES_15M = 60        # enough history for swings + impulse + chart context
+CANDLES_15M = 60
 
 # Strategy params
-SWING_LOOKBACK = 3      # bars each side for a swing point
-SL_BUFFER_USD = 0.50    # buffer beyond OB invalidation
-RR_TARGET = 3.0         # fixed 3R target
+SWING_LOOKBACK = 3
+SL_BUFFER_USD = 0.50
+RR_TARGET = 3.0
+ATR_PERIOD = 14
+ORDER_EXPIRY_HOURS = 24   # placed limit must tap within a day (automation rule)
 
-# Scan cadence: once per closed 15M candle.
 SCAN_INTERVAL_SECONDS = 15 * 60
-
-# How many recent signals to keep in state for /recent
-MAX_LOGGED_SIGNALS = 100
+MAX_LOGGED_SIGNALS = 200
 
 STATE_FILE = "bot_state.json"
 
 # =============================================================================
 # LOGGING
 # =============================================================================
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                    level=logging.INFO)
 log = logging.getLogger("jp-gold-bot")
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 # =============================================================================
-# STATE  (minimal — no trades, just dedup memory + a signal log)
+# STATE
 # =============================================================================
 state: Dict[str, Any] = {
     "paused": False,
     "last_scan_ts": None,
     "last_2h_trend": None,
-    "last_signal_ob_key": None,   # dedup: OB of the most recent fired setup
-    "signals": [],                # rolling log of fired signals (for /recent)
+    "last_signal_ob_key": None,
+    "signals": [],
     "signals_today": 0,
     "today_date": None,
     "bot_started_at": datetime.now(timezone.utc).isoformat(),
@@ -113,9 +109,9 @@ def load_state():
         try:
             with open(STATE_FILE, "r") as f:
                 state.update(json.load(f))
-            log.info(f"State loaded: {len(state.get('signals', []))} logged signals")
+            log.info(f"State loaded: {len(state.get('signals', []))} signals")
         except Exception as e:
-            log.warning(f"Could not load state: {e}. Fresh start.")
+            log.warning(f"Could not load state: {e}")
 
 
 def save_state():
@@ -125,7 +121,7 @@ def save_state():
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, default=str)
     except Exception as e:
-        log.error(f"Could not save state: {e}")
+        log.error(f"save_state: {e}")
 
 
 def reset_daily_counter():
@@ -136,22 +132,17 @@ def reset_daily_counter():
 
 
 # =============================================================================
-# DATA FETCHING  (drops the forming candle at source)
+# DATA
 # =============================================================================
 def fetch_candles(timeframe: str, count: int) -> Optional[List[Dict]]:
     if not TWELVE_DATA_KEY:
         log.error("TWELVE_DATA_KEY not set")
         return None
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": INSTRUMENT_API,
-        "interval": timeframe,
-        "outputsize": count,
-        "apikey": TWELVE_DATA_KEY,
-        "format": "JSON",
-    }
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get("https://api.twelvedata.com/time_series", params={
+            "symbol": INSTRUMENT_API, "interval": timeframe,
+            "outputsize": count, "apikey": TWELVE_DATA_KEY, "format": "JSON",
+        }, timeout=15)
         r.raise_for_status()
         data = r.json()
         if data.get("status") == "error":
@@ -160,46 +151,37 @@ def fetch_candles(timeframe: str, count: int) -> Optional[List[Dict]]:
         values = data.get("values", [])
         if not values:
             return None
-        candles = []
-        for v in reversed(values):  # oldest first
-            candles.append({
-                "time": v["datetime"],
-                "open": float(v["open"]),
-                "high": float(v["high"]),
-                "low": float(v["low"]),
-                "close": float(v["close"]),
-            })
-        # Drop the still-forming candle so every function sees only CLOSED bars.
+        candles = [{
+            "time": v["datetime"], "open": float(v["open"]),
+            "high": float(v["high"]), "low": float(v["low"]),
+            "close": float(v["close"]),
+        } for v in reversed(values)]
+        # Drop the forming candle — only closed bars downstream.
         if len(candles) > 1:
             candles = candles[:-1]
         return candles
     except Exception as e:
-        log.error(f"fetch_candles({timeframe}) failed: {e}")
+        log.error(f"fetch_candles({timeframe}): {e}")
         return None
 
 
 # =============================================================================
-# STRUCTURE DETECTION  (pure deterministic candle math — no AI, no guessing)
+# STRUCTURE DETECTION (deterministic candle math)
 # =============================================================================
 def detect_swings(candles: List[Dict], lookback: int = SWING_LOOKBACK) -> List[Dict]:
-    """Fractal swing points: a swing high has `lookback` lower highs on each
-    side; a swing low has `lookback` higher lows on each side."""
     swings = []
     for i in range(lookback, len(candles) - lookback):
         c = candles[i]
-        is_high = all(candles[i + j]["high"] <= c["high"]
-                      for j in range(-lookback, lookback + 1) if j != 0)
-        is_low = all(candles[i + j]["low"] >= c["low"]
-                     for j in range(-lookback, lookback + 1) if j != 0)
-        if is_high:
+        if all(candles[i + j]["high"] <= c["high"]
+               for j in range(-lookback, lookback + 1) if j != 0):
             swings.append({"idx": i, "type": "high", "price": c["high"], "time": c["time"]})
-        if is_low:
+        if all(candles[i + j]["low"] >= c["low"]
+               for j in range(-lookback, lookback + 1) if j != 0):
             swings.append({"idx": i, "type": "low", "price": c["low"], "time": c["time"]})
     return swings
 
 
 def determine_trend(candles: List[Dict]) -> str:
-    """2H trend by HH/HL vs LH/LL on recent swings. CONTEXT ONLY."""
     swings = detect_swings(candles)
     highs = [s for s in swings if s["type"] == "high"][-3:]
     lows = [s for s in swings if s["type"] == "low"][-3:]
@@ -216,10 +198,20 @@ def determine_trend(candles: List[Dict]) -> str:
     return "range"
 
 
+def compute_atr(candles: List[Dict], period: int = ATR_PERIOD) -> Optional[float]:
+    """Average True Range over the last `period` closed candles."""
+    if len(candles) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        h, l = candles[i]["high"], candles[i]["low"]
+        pc = candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    recent = trs[-period:]
+    return sum(recent) / len(recent) if recent else None
+
+
 def detect_bos(candles: List[Dict]) -> Optional[Dict]:
-    """Break of structure on the most recent CLOSED candle.
-    Bullish: close above the most recent swing high.
-    Bearish: close below the most recent swing low."""
     if len(candles) < SWING_LOOKBACK * 2 + 2:
         return None
     last_idx = len(candles) - 1
@@ -227,44 +219,30 @@ def detect_bos(candles: List[Dict]) -> Optional[Dict]:
     swings = detect_swings(candles[:last_idx])
     if not swings:
         return None
-    recent_high = next((s for s in reversed(swings) if s["type"] == "high"), None)
-    recent_low = next((s for s in reversed(swings) if s["type"] == "low"), None)
-    if recent_high and last["close"] > recent_high["price"]:
-        return {"direction": "bullish", "bos_idx": last_idx,
-                "bos_candle": last, "broken_swing": recent_high}
-    if recent_low and last["close"] < recent_low["price"]:
-        return {"direction": "bearish", "bos_idx": last_idx,
-                "bos_candle": last, "broken_swing": recent_low}
+    rh = next((s for s in reversed(swings) if s["type"] == "high"), None)
+    rl = next((s for s in reversed(swings) if s["type"] == "low"), None)
+    if rh and last["close"] > rh["price"]:
+        return {"direction": "bullish", "bos_idx": last_idx, "bos_candle": last, "broken_swing": rh}
+    if rl and last["close"] < rl["price"]:
+        return {"direction": "bearish", "bos_idx": last_idx, "bos_candle": last, "broken_swing": rl}
     return None
 
 
 def find_order_block(candles: List[Dict], bos: Dict) -> Optional[Dict]:
-    """OB = last opposing-color candle inside the impulse leg, scanning back
-    from the BOS candle toward the broken swing."""
     direction = bos["direction"]
-    bos_idx = bos["bos_idx"]
-    broken_idx = bos["broken_swing"]["idx"]
-    for i in range(bos_idx - 1, broken_idx, -1):
+    for i in range(bos["bos_idx"] - 1, bos["broken_swing"]["idx"], -1):
         c = candles[i]
-        is_bearish = c["close"] < c["open"]
-        is_bullish = c["close"] > c["open"]
-        if direction == "bullish" and is_bearish:
+        if direction == "bullish" and c["close"] < c["open"]:
             return {"idx": i, **c}
-        if direction == "bearish" and is_bullish:
+        if direction == "bearish" and c["close"] > c["open"]:
             return {"idx": i, **c}
     return None
 
 
 def find_fvg(candles: List[Dict], bos: Dict, ob_idx: int) -> Optional[Dict]:
-    """3-candle FVG inside the impulse leg between the OB and the BOS candle.
-    Bullish FVG: gap between candle[i] high and candle[i+2] low.
-    Bearish FVG: gap between candle[i] low and candle[i+2] high.
-    MANDATORY — no FVG, no setup."""
     direction = bos["direction"]
-    bos_idx = bos["bos_idx"]
-    for i in range(ob_idx, bos_idx - 1):
-        c1 = candles[i]
-        c3 = candles[i + 2]
+    for i in range(ob_idx, bos["bos_idx"] - 1):
+        c1, c3 = candles[i], candles[i + 2]
         if direction == "bullish" and c1["high"] < c3["low"]:
             return {"low": c1["high"], "high": c3["low"], "idx": i + 1}
         if direction == "bearish" and c1["low"] > c3["high"]:
@@ -273,7 +251,6 @@ def find_fvg(candles: List[Dict], bos: Dict, ob_idx: int) -> Optional[Dict]:
 
 
 def compute_levels(direction: str, ob: Dict) -> Dict:
-    """Entry at OB open; stop beyond OB invalidation + buffer; target = 3R."""
     entry = ob["open"]
     if direction == "bullish":
         sl = ob["low"] - SL_BUFFER_USD
@@ -287,256 +264,270 @@ def compute_levels(direction: str, ob: Dict) -> Dict:
 
 
 def ob_key(direction: str, ob: Dict) -> str:
-    """Dedup key: a setup is 'the same' if it uses the same OB candle time and
-    direction. Prevents re-firing the same setup on consecutive scans."""
     return f"{ob['time']}_{direction}"
 
 
+def detect_session(dt: datetime) -> str:
+    """Label the session a signal fired in (UTC).
+       London 07-12, NY 12-21, Asia otherwise."""
+    h = dt.hour
+    if 7 <= h < 12:
+        return "London"
+    if 12 <= h < 21:
+        return "NY"
+    return "Asia"
+
+
+def in_tradeable_session() -> bool:
+    h = datetime.now(timezone.utc).hour
+    if SESSION_START_UTC <= h < SESSION_END_UTC:
+        return True
+    if INCLUDE_ASIA and (ASIA_START_UTC <= h < ASIA_END_UTC):
+        return True
+    return False
+
+
 # =============================================================================
-# CHART IMAGE
+# CHART
 # =============================================================================
-def render_setup_chart(candles: List[Dict], bos: Dict, ob: Dict, fvg: Dict,
-                       levels: Dict, trend_2h: str, signal_id: str) -> Optional[bytes]:
-    """Render an annotated candlestick PNG:
-       OB shaded box, grey dashed entry, red dashed stop, blue dashed 3R target,
-       FVG light band, with full context burned into the title."""
+def render_setup_chart(candles, bos, ob, fvg, levels, trend_2h, signal_id) -> Optional[bytes]:
     try:
-        # Show a window around the setup (last ~40 candles).
         window = candles[-40:] if len(candles) > 40 else candles
-        base_idx = len(candles) - len(window)
-
+        base = len(candles) - len(window)
         fig, ax = plt.subplots(figsize=(9, 5.5), dpi=110)
-        fig.patch.set_facecolor("#1e1e1e")
-        ax.set_facecolor("#1e1e1e")
-
+        fig.patch.set_facecolor("#1e1e1e"); ax.set_facecolor("#1e1e1e")
         for n, c in enumerate(window):
             up = c["close"] >= c["open"]
-            color = "#81b29a" if up else "#e07a5f"
-            # wick
-            ax.plot([n, n], [c["low"], c["high"]], color=color, linewidth=0.8, zorder=2)
-            # body
-            lo = min(c["open"], c["close"])
-            hi = max(c["open"], c["close"])
+            col = "#81b29a" if up else "#e07a5f"
+            ax.plot([n, n], [c["low"], c["high"]], color=col, linewidth=0.8, zorder=2)
+            lo, hi = min(c["open"], c["close"]), max(c["open"], c["close"])
             ax.add_patch(Rectangle((n - 0.3, lo), 0.6, max(hi - lo, 0.01),
-                                   facecolor=color, edgecolor=color, zorder=3))
-
-        # OB box (spans from its candle to the right edge)
-        ob_x = ob["idx"] - base_idx
-        if ob_x < 0:
-            ob_x = 0
+                                   facecolor=col, edgecolor=col, zorder=3))
+        ob_x = max(ob["idx"] - base, 0)
         ax.add_patch(Rectangle((ob_x - 0.4, ob["low"]), (len(window) - ob_x) + 0.4,
-                               ob["high"] - ob["low"],
-                               facecolor="#3a3a52", alpha=0.35, edgecolor="none", zorder=1))
-
-        # FVG band
+                               ob["high"] - ob["low"], facecolor="#3a3a52",
+                               alpha=0.35, edgecolor="none", zorder=1))
         if fvg:
             ax.add_patch(Rectangle((0, fvg["low"]), len(window), fvg["high"] - fvg["low"],
                                    facecolor="#2d4a4a", alpha=0.25, edgecolor="none", zorder=1))
-
-        # Level lines
         ax.axhline(levels["entry"], color="#bfbfbf", linestyle="--", linewidth=1.2,
                    zorder=4, label=f"Entry {levels['entry']:.2f}")
         ax.axhline(levels["sl"], color="#e07a5f", linestyle="--", linewidth=1.2,
                    zorder=4, label=f"Stop {levels['sl']:.2f}")
         ax.axhline(levels["target"], color="#6699cc", linestyle="--", linewidth=1.2,
                    zorder=4, label=f"3R {levels['target']:.2f}")
-
-        ax.set_title(
-            f"{INSTRUMENT_DISPLAY}  {bos['direction'].upper()}  |  2H trend: {trend_2h}  |  {signal_id}",
-            color="#e0e0e0", fontsize=10)
+        ax.set_title(f"{INSTRUMENT_DISPLAY}  {bos['direction'].upper()}  |  "
+                     f"2H trend: {trend_2h}  |  {signal_id}",
+                     color="#e0e0e0", fontsize=10)
         ax.tick_params(colors="#8e8e93", labelsize=7)
-        for spine in ax.spines.values():
-            spine.set_color("#333333")
+        for s in ax.spines.values():
+            s.set_color("#333333")
         ax.legend(loc="upper left", fontsize=7, facecolor="#252526",
                   edgecolor="#333333", labelcolor="#e0e0e0")
-        ax.set_xlim(-1, len(window))
-        ax.margins(y=0.1)
-
+        ax.set_xlim(-1, len(window)); ax.margins(y=0.1)
         buf = io.BytesIO()
         fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
-        plt.close(fig)
-        buf.seek(0)
+        plt.close(fig); buf.seek(0)
         return buf.read()
     except Exception as e:
-        log.error(f"chart render failed: {e}")
-        plt.close("all")
-        return None
+        log.error(f"chart: {e}"); plt.close("all"); return None
 
 
 # =============================================================================
 # TELEGRAM
 # =============================================================================
 def send_telegram(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram creds missing — would have sent:\n" + text[:200])
-        return
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        log.warning("Telegram creds missing"); return
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=10)
-        if not r.ok:
-            log.error(f"Telegram send failed: {r.status_code} {r.text}")
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                            "parse_mode": "HTML", "disable_web_page_preview": True},
+                      timeout=10)
     except Exception as e:
-        log.error(f"Telegram send error: {e}")
+        log.error(f"send_telegram: {e}")
 
 
 def send_telegram_photo(image: bytes, caption: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram creds missing — photo not sent")
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000],
-                  "parse_mode": "HTML"},
-            files={"photo": ("setup.png", image, "image/png")},
-            timeout=20)
-        if not r.ok:
-            log.error(f"Telegram photo failed: {r.status_code} {r.text}")
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                      data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000],
+                            "parse_mode": "HTML"},
+                      files={"photo": ("setup.png", image, "image/png")}, timeout=20)
     except Exception as e:
-        log.error(f"Telegram photo error: {e}")
+        log.error(f"send_photo: {e}")
+
+
+def send_telegram_reply(chat_id: str, text: str):
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                            "disable_web_page_preview": True}, timeout=10)
+    except Exception as e:
+        log.error(f"reply: {e}")
 
 
 # =============================================================================
-# SESSION + SCAN
+# SIGNAL RECORD  (the full automation-ready contract)
 # =============================================================================
-def in_session() -> bool:
-    h = datetime.now(timezone.utc).hour
-    return SESSION_START_UTC <= h < SESSION_END_UTC
+def build_record(signal_id, bos, ob, fvg, levels, trend_2h, atr) -> Dict:
+    now = datetime.now(timezone.utc)
+    risk_atr = round(levels["risk"] / atr, 2) if atr else None
+    return {
+        # --- filled now by the detector ---
+        "id": signal_id,
+        "timestamp": now.isoformat(),
+        "symbol": INSTRUMENT_DISPLAY,
+        "direction": bos["direction"],
+        "trend_2h": trend_2h,
+        "session": detect_session(now),
+        "entry": round(levels["entry"], 2),
+        "stop": round(levels["sl"], 2),
+        "target": round(levels["target"], 2),
+        "risk_distance": round(levels["risk"], 2),   # dollars/points
+        "risk_atr": risk_atr,                          # risk as multiple of ATR(14)
+        "atr": round(atr, 2) if atr else None,
+        "rr_target": RR_TARGET,
+        "bos_time": bos["bos_candle"]["time"],
+        "ob_time": ob["time"],
+        "chart_url": None,                             # set when image hosting lands
+        # --- intent for automation (planned, not yet executed) ---
+        "risk_percent": RISK_PERCENT,
+        "order_expiry_hours": ORDER_EXPIRY_HOURS,
+        # --- filled by MetaApi when automation is live ---
+        "order_placed": None,
+        "fill_status": None,      # pending / filled / cancelled / expired
+        "fill_price": None,
+        "fill_time": None,
+        "outcome": None,          # win / loss / breakeven / no-fill (broker truth)
+        "exit_price": None,
+        "exit_time": None,
+        "r_result": None,         # actual R achieved
+        "lot_size": None,
+        "pnl": None,
+        # --- filled by you in the viewer ---
+        "eye_agreement": None,    # agree / skip
+        "notes": None,
+    }
 
 
-def make_signal_id(bos_candle_time: str, direction: str) -> str:
-    clean = bos_candle_time.replace(" ", "_").replace(":", "").replace("-", "")
+# =============================================================================
+# SCAN
+# =============================================================================
+def make_signal_id(t: str, direction: str) -> str:
+    clean = t.replace(" ", "_").replace(":", "").replace("-", "")
     return f"{clean}_{direction[0]}"
 
 
 def scan():
-    """One scan per closed 15M candle. Detect -> draw -> log -> notify. No tracking."""
     try:
         if state.get("paused"):
             return
         state["last_scan_ts"] = datetime.now(timezone.utc).isoformat()
         reset_daily_counter()
-
-        if not in_session():
+        if not in_tradeable_session():
             return
 
         candles_15m = fetch_candles(TF_15M, CANDLES_15M)
         if not candles_15m:
-            log.warning("scan: no 15M candles")
             return
-
-        # 2H trend — context only
         candles_2h = fetch_candles(TF_2H, CANDLES_2H)
         trend_2h = determine_trend(candles_2h) if candles_2h else "unknown"
         state["last_2h_trend"] = trend_2h
 
-        # 1) Structure break on the latest closed candle
         bos = detect_bos(candles_15m)
         if not bos:
-            save_state()
-            return
-
-        # 2) Order block
+            save_state(); return
         ob = find_order_block(candles_15m, bos)
         if not ob:
-            log.info("scan: BOS but no OB -> skip")
-            save_state()
-            return
-
-        # 3) FVG is MANDATORY
+            save_state(); return
         fvg = find_fvg(candles_15m, bos, ob["idx"])
         if not fvg:
-            log.info("scan: BOS+OB but no FVG -> skip (FVG mandatory)")
-            save_state()
-            return
+            log.info("BOS+OB but no FVG -> skip (FVG mandatory)")
+            save_state(); return
 
-        # Dedup: same OB as last fired setup? skip.
         key = ob_key(bos["direction"], ob)
         if key == state.get("last_signal_ob_key"):
             return
 
         levels = compute_levels(bos["direction"], ob)
         if levels["risk"] <= 0:
-            log.info("scan: invalid risk -> skip")
             return
-
-        # Dead-on-arrival guard: price already through OB invalidation on BOS candle
         bc = bos["bos_candle"]
         if bos["direction"] == "bullish" and bc["low"] <= levels["sl"]:
-            log.info("scan: OB already invalidated -> skip")
             return
         if bos["direction"] == "bearish" and bc["high"] >= levels["sl"]:
-            log.info("scan: OB already invalidated -> skip")
             return
 
+        atr = compute_atr(candles_15m)
         signal_id = make_signal_id(bos["bos_candle"]["time"], bos["direction"])
-        direction_label = "🟢 BUY" if bos["direction"] == "bullish" else "🔴 SELL"
+        record = build_record(signal_id, bos, ob, fvg, levels, trend_2h, atr)
 
-        # Build + log the signal record
-        record = {
-            "id": signal_id,
-            "time": datetime.now(timezone.utc).isoformat(),
-            "direction": bos["direction"],
-            "trend_2h": trend_2h,
-            "entry": levels["entry"],
-            "sl": levels["sl"],
-            "target": levels["target"],
-            "risk": levels["risk"],
-            "bos_time": bos["bos_candle"]["time"],
-            "ob_time": ob["time"],
-        }
         state["signals"].append(record)
         state["last_signal_ob_key"] = key
         state["signals_today"] += 1
         save_state()
 
-        # Telegram text
-        msg = (
-            f"📐 <b>SETUP · {INSTRUMENT_DISPLAY} · {direction_label}</b>\n"
-            f"#setup #{bos['direction']}\n\n"
-            f"<b>2H trend (context):</b> {trend_2h}\n"
-            f"<b>Entry (OB):</b> {levels['entry']:.2f}\n"
-            f"<b>Stop:</b> {levels['sl']:.2f}\n"
-            f"<b>Target (3R):</b> {levels['target']:.2f}\n"
-            f"<b>Risk distance:</b> {levels['risk']:.2f}\n\n"
-            f"<i>ID: {signal_id}</i>\n"
-            f"<i>Validate against TradingView. Not auto-traded.</i>"
-        )
+        dir_label = "🟢 BUY" if bos["direction"] == "bullish" else "🔴 SELL"
+        atr_line = f"\n<b>Risk in ATR:</b> {record['risk_atr']}x ATR" if record["risk_atr"] else ""
+        msg = (f"📐 <b>SETUP · {INSTRUMENT_DISPLAY} · {dir_label}</b>\n"
+               f"#setup #{bos['direction']}\n\n"
+               f"<b>2H trend (context):</b> {trend_2h}\n"
+               f"<b>Session:</b> {record['session']}\n"
+               f"<b>Entry (OB):</b> {record['entry']:.2f}\n"
+               f"<b>Stop:</b> {record['stop']:.2f}\n"
+               f"<b>Target (3R):</b> {record['target']:.2f}\n"
+               f"<b>Risk distance:</b> {record['risk_distance']:.2f}{atr_line}\n\n"
+               f"<i>ID: {signal_id}</i>\n"
+               f"<i>Validate against TradingView. Not auto-traded.</i>")
         send_telegram(msg)
 
-        # Annotated chart
         img = render_setup_chart(candles_15m, bos, ob, fvg, levels, trend_2h, signal_id)
         if img:
-            cap = (f"{INSTRUMENT_DISPLAY} {direction_label} | 2H: {trend_2h} | "
-                   f"E {levels['entry']:.2f} / SL {levels['sl']:.2f} / "
-                   f"3R {levels['target']:.2f} | {signal_id}")
-            send_telegram_photo(img, cap)
-
-        log.info(f"SETUP fired: {signal_id} ({bos['direction']}, 2H {trend_2h})")
-
+            send_telegram_photo(
+                img, f"{INSTRUMENT_DISPLAY} {dir_label} | 2H: {trend_2h} | "
+                     f"{record['session']} | E {record['entry']:.2f} / "
+                     f"SL {record['stop']:.2f} / 3R {record['target']:.2f} | {signal_id}")
+        log.info(f"SETUP {signal_id} ({bos['direction']}, 2H {trend_2h}, {record['session']})")
     except Exception as e:
-        log.exception(f"scan() error: {e}")
+        log.exception(f"scan: {e}")
 
 
 # =============================================================================
-# FLASK
+# FLASK  (+ CORS so the Vercel-hosted viewer can fetch /signals)
 # =============================================================================
 app = Flask(__name__)
+
+
+@app.after_request
+def add_cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
 
 
 @app.route("/")
 def health():
     return jsonify({
-        "status": "ok",
-        "bot": "JP Gold Bot v3.2 (detector)",
+        "status": "ok", "bot": "JP Gold Bot v3.2 (detector)",
         "paused": state.get("paused", False),
         "last_scan": state.get("last_scan_ts"),
         "last_2h_trend": state.get("last_2h_trend"),
         "signals_logged": len(state.get("signals", [])),
-        "in_session": in_session(),
+        "in_session": in_tradeable_session(),
+    })
+
+
+@app.route("/signals")
+def signals_endpoint():
+    """Full signal log as JSON for the JP Signals viewer."""
+    return jsonify({
+        "count": len(state.get("signals", [])),
+        "symbol": INSTRUMENT_DISPLAY,
+        "signals": state.get("signals", []),
     })
 
 
@@ -551,117 +542,89 @@ def test_functions_http():
         out["trend_2h"] = determine_trend(c2h)
     if c15:
         out["swings_15m"] = len(detect_swings(c15))
-        bos = detect_bos(c15)
-        out["bos_now"] = bool(bos)
+        out["atr_15m"] = compute_atr(c15)
     out["telegram_creds"] = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
     return jsonify(out)
 
 
 # =============================================================================
-# TELEGRAM COMMANDS (long-polling via getUpdates in a background thread)
+# TELEGRAM COMMAND POLLING
 # =============================================================================
 def handle_command(text: str, chat_id: str):
-    cmd = text.strip().split()[0].lower().lstrip("/")
-    cmd = cmd.split("@")[0]
+    cmd = text.strip().split()[0].lower().lstrip("/").split("@")[0]
     if cmd in ("start", "help"):
-        reply = (
-            "JP Gold Bot v3.2 — Setup Detector\n\n"
-            "I detect textbook 15M SMC setups (FVG-triggered), draw them, "
-            "and log them. I do NOT trade or track trades. You validate each "
-            "image against TradingView.\n\n"
-            "/status — diagnostics\n"
-            "/config — parameters\n"
-            "/recent — last few setups\n"
-            "/test_functions — smoke test\n"
-            "/pause /resume — control scanning"
-        )
+        reply = ("JP Gold Bot v3.2 — Setup Detector\n\n"
+                 "I detect 15M FVG setups, draw them, log them. I don't trade.\n\n"
+                 "/status /config /recent /test_functions /pause /resume")
     elif cmd == "status":
-        reply = (
-            f"<b>v3.2 Detector — Status</b>\n\n"
-            f"Paused: {'YES' if state.get('paused') else 'no'}\n"
-            f"In session: {'yes' if in_session() else 'no'} "
-            f"(UTC hour {datetime.now(timezone.utc).hour})\n"
-            f"Last 2H trend: {state.get('last_2h_trend')}\n"
-            f"Last scan: {state.get('last_scan_ts')}\n"
-            f"Setups today: {state.get('signals_today', 0)}\n"
-            f"Setups logged total: {len(state.get('signals', []))}"
-        )
+        reply = (f"<b>v3.2 Detector — Status</b>\n\n"
+                 f"Paused: {'YES' if state.get('paused') else 'no'}\n"
+                 f"In session: {'yes' if in_tradeable_session() else 'no'} "
+                 f"(UTC hour {datetime.now(timezone.utc).hour})\n"
+                 f"Asia enabled: {'yes' if INCLUDE_ASIA else 'no'}\n"
+                 f"Last 2H trend: {state.get('last_2h_trend')}\n"
+                 f"Last scan: {state.get('last_scan_ts')}\n"
+                 f"Setups today: {state.get('signals_today', 0)}\n"
+                 f"Setups logged: {len(state.get('signals', []))}")
     elif cmd == "config":
-        reply = (
-            f"<b>Config</b>\n"
-            f"Instrument: {INSTRUMENT_DISPLAY}\n"
-            f"Detection: 15M FVG-triggered (BOS + OB + mandatory FVG)\n"
-            f"2H trend: context only (no filter)\n"
-            f"Entry: OB open · Stop: OB invalidation +${SL_BUFFER_USD} · "
-            f"Target: {RR_TARGET:.0f}R\n"
-            f"Scan: every {SCAN_INTERVAL_SECONDS // 60} min (per closed candle)\n"
-            f"Sessions: {SESSION_START_UTC:02d}:00-{SESSION_END_UTC:02d}:00 UTC\n"
-            f"Trade tracking: NONE (detector only)"
-        )
+        reply = (f"<b>Config</b>\n"
+                 f"Instrument: {INSTRUMENT_DISPLAY}\n"
+                 f"Detection: 15M FVG-triggered (BOS+OB+mandatory FVG)\n"
+                 f"2H trend: context only\n"
+                 f"Entry: OB · Stop: OB inval +${SL_BUFFER_USD} · Target: {RR_TARGET:.0f}R\n"
+                 f"ATR period: {ATR_PERIOD}\n"
+                 f"Risk %: {RISK_PERCENT}% (for automation sizing)\n"
+                 f"Order expiry: {ORDER_EXPIRY_HOURS}h\n"
+                 f"Scan: every {SCAN_INTERVAL_SECONDS // 60} min\n"
+                 f"Sessions: {SESSION_START_UTC:02d}:00-{SESSION_END_UTC:02d}:00 UTC"
+                 f"{' + Asia' if INCLUDE_ASIA else ''}")
     elif cmd == "recent":
         sigs = state.get("signals", [])[-5:]
         if not sigs:
             reply = "No setups logged yet."
         else:
-            lines = ["<b>Recent setups</b>"]
-            for s in reversed(sigs):
-                lines.append(
-                    f"{s['id']} · {s['direction'][:4]} · 2H {s['trend_2h']} · "
-                    f"E {s['entry']:.2f}/SL {s['sl']:.2f}/3R {s['target']:.2f}")
-            reply = "\n".join(lines)
+            reply = "<b>Recent setups</b>\n" + "\n".join(
+                f"{s['id']} · {s['direction'][:4]} · {s.get('session','?')} · "
+                f"2H {s['trend_2h']} · E {s['entry']:.2f}/SL {s['stop']:.2f}/"
+                f"3R {s['target']:.2f}" for s in reversed(sigs))
     elif cmd == "pause":
-        state["paused"] = True
-        save_state()
-        reply = "⏸ Scanning paused."
+        state["paused"] = True; save_state(); reply = "Scanning paused."
     elif cmd == "resume":
-        state["paused"] = False
-        save_state()
-        reply = "▶️ Scanning resumed."
+        state["paused"] = False; save_state(); reply = "Scanning resumed."
     elif cmd == "test_functions":
-        c15 = fetch_candles(TF_15M, 50)
-        c2h = fetch_candles(TF_2H, 50)
+        c15 = fetch_candles(TF_15M, 50); c2h = fetch_candles(TF_2H, 50)
+        atrv = compute_atr(c15) if c15 else None
         checks = [
             ("Fetch 15M", bool(c15), f"{len(c15) if c15 else 0} bars"),
             ("Fetch 2H", bool(c2h), f"{len(c2h) if c2h else 0} bars"),
             ("15M swings", bool(c15 and detect_swings(c15)),
              f"{len(detect_swings(c15)) if c15 else 0}"),
+            ("ATR(14)", bool(atrv), f"{atrv:.2f}" if atrv else "-"),
             ("2H trend", bool(c2h), determine_trend(c2h) if c2h else "-"),
             ("Telegram creds", bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID), ""),
-            ("Chart engine", True, "matplotlib ready"),
+            ("Chart engine", True, "matplotlib"),
+            ("/signals", True, f"{len(state.get('signals', []))} logged"),
         ]
         reply = "<b>Test Functions</b>\n\n" + "\n".join(
-            f"{'✅' if ok else '❌'} {name}" + (f" — {extra}" if extra else "")
-            for name, ok, extra in checks)
+            f"{'OK' if ok else 'X'} {n}" + (f" - {e}" if e else "")
+            for n, ok, e in checks)
     else:
-        return  # unknown command: ignore
+        return
     send_telegram_reply(chat_id, reply)
 
 
-def send_telegram_reply(chat_id: str, text: str):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True}, timeout=10)
-    except Exception as e:
-        log.error(f"reply failed: {e}")
-
-
 def poll_telegram():
-    """Simple long-poll loop for commands. Runs in a background thread."""
     if not TELEGRAM_TOKEN:
-        log.warning("No TELEGRAM_TOKEN — command polling disabled")
-        return
+        log.warning("No TELEGRAM_TOKEN — polling disabled"); return
     offset = None
-    log.info("Telegram command polling started")
+    log.info("Telegram polling started")
     while True:
         try:
             params = {"timeout": 50}
             if offset is not None:
                 params["offset"] = offset
-            r = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                params=params, timeout=60)
+            r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                             params=params, timeout=60)
             if not r.ok:
                 continue
             for upd in r.json().get("result", []):
@@ -674,7 +637,7 @@ def poll_telegram():
                 if text.startswith("/"):
                     handle_command(text, chat_id)
         except Exception as e:
-            log.warning(f"poll error: {e}")
+            log.warning(f"poll: {e}")
 
 
 # =============================================================================
@@ -685,13 +648,12 @@ def start_scheduler():
     sched.add_job(scan, "interval", seconds=SCAN_INTERVAL_SECONDS, id="scan",
                   max_instances=1, coalesce=True)
     sched.start()
-    log.info(f"Scheduler started: scan every {SCAN_INTERVAL_SECONDS // 60} min")
+    log.info(f"Scheduler: scan every {SCAN_INTERVAL_SECONDS // 60} min")
 
 
 def start_polling_thread():
     import threading
-    t = threading.Thread(target=poll_telegram, daemon=True)
-    t.start()
+    threading.Thread(target=poll_telegram, daemon=True).start()
 
 
 load_state()
@@ -701,15 +663,15 @@ start_polling_thread()
 try:
     send_telegram(
         "🟢 <b>JP Gold Bot v3.2 online</b>\n#startup\n\n"
-        "Setup-detector mode. I find 15M FVG setups, draw them, log them. "
-        "No trade tracking.\n"
+        "Setup-detector mode, automation-ready records.\n"
         f"Instrument: {INSTRUMENT_DISPLAY}\n"
         f"Scan: every {SCAN_INTERVAL_SECONDS // 60} min · "
-        f"Sessions {SESSION_START_UTC:02d}:00-{SESSION_END_UTC:02d}:00 UTC\n"
-        "Use /status, /test_functions."
-    )
+        f"Sessions {SESSION_START_UTC:02d}:00-{SESSION_END_UTC:02d}:00 UTC"
+        f"{' + Asia' if INCLUDE_ASIA else ''}\n"
+        "New: /signals endpoint, ATR risk, session tags.\n"
+        "Use /status, /test_functions.")
 except Exception as e:
-    log.warning(f"startup ping failed: {e}")
+    log.warning(f"startup ping: {e}")
 
 
 if __name__ == "__main__":
