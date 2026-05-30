@@ -348,16 +348,55 @@ def send_telegram(text: str):
         log.error(f"send_telegram: {e}")
 
 
-def send_telegram_photo(image: bytes, caption: str):
+def grade_keyboard(signal_id: str, selected: Optional[str] = None) -> dict:
+    """Inline A/B/C buttons. The currently-selected grade is bracketed,
+    e.g. [A] B C, so the chosen one is visible without emojis/color."""
+    def label(g):
+        return f"[{g}]" if selected == g else g
+    return {"inline_keyboard": [[
+        {"text": label("A"), "callback_data": f"grade|{signal_id}|A"},
+        {"text": label("B"), "callback_data": f"grade|{signal_id}|B"},
+        {"text": label("C"), "callback_data": f"grade|{signal_id}|C"},
+    ]]}
+
+
+def send_telegram_photo(image: bytes, caption: str, reply_markup: Optional[dict] = None):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-        return
+        return None
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                      data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000],
-                            "parse_mode": "HTML"},
-                      files={"photo": ("setup.png", image, "image/png")}, timeout=20)
+        data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1000],
+                "parse_mode": "HTML"}
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup)
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                          data=data,
+                          files={"photo": ("setup.png", image, "image/png")}, timeout=20)
+        if r.ok:
+            return r.json().get("result", {}).get("message_id")
     except Exception as e:
         log.error(f"send_photo: {e}")
+    return None
+
+
+def edit_photo_markup(message_id: int, reply_markup: dict):
+    """Update just the inline buttons on an already-sent photo message."""
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and message_id):
+        return
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageReplyMarkup",
+                      json={"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id,
+                            "reply_markup": reply_markup}, timeout=10)
+    except Exception as e:
+        log.error(f"edit_markup: {e}")
+
+
+def answer_callback(callback_id: str, text: str = ""):
+    """Acknowledge a button tap so Telegram stops the loading spinner."""
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                      json={"callback_query_id": callback_id, "text": text}, timeout=10)
+    except Exception as e:
+        log.error(f"answer_cb: {e}")
 
 
 def send_telegram_reply(chat_id: str, text: str):
@@ -407,9 +446,11 @@ def build_record(signal_id, bos, ob, fvg, levels, trend_2h, atr) -> Dict:
         "r_result": None,         # actual R achieved
         "lot_size": None,
         "pnl": None,
-        # --- filled by you in the viewer ---
-        "eye_agreement": None,    # agree / skip
+        # --- filled by you (Telegram tap now, or app later) ---
+        "grade": None,            # A / B / C — your quality rating of the setup
+        "eye_agreement": None,    # agree / skip (richer rating, app)
         "notes": None,
+        "telegram_message_id": None,  # for editing the grade buttons after a tap
     }
 
 
@@ -486,10 +527,15 @@ def scan():
 
         img = render_setup_chart(candles_15m, bos, ob, fvg, levels, trend_2h, signal_id)
         if img:
-            send_telegram_photo(
+            msg_id = send_telegram_photo(
                 img, f"{INSTRUMENT_DISPLAY} {dir_label} | 2H: {trend_2h} | "
                      f"{record['session']} | E {record['entry']:.2f} / "
-                     f"SL {record['stop']:.2f} / 3R {record['target']:.2f} | {signal_id}")
+                     f"SL {record['stop']:.2f} / 3R {record['target']:.2f} | {signal_id}\n"
+                     f"Grade this setup:",
+                reply_markup=grade_keyboard(signal_id))
+            if msg_id:
+                record["telegram_message_id"] = msg_id
+                save_state()
         log.info(f"SETUP {signal_id} ({bos['direction']}, 2H {trend_2h}, {record['session']})")
     except Exception as e:
         log.exception(f"scan: {e}")
@@ -504,7 +550,7 @@ app = Flask(__name__)
 @app.after_request
 def add_cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
 
@@ -529,6 +575,44 @@ def signals_endpoint():
         "symbol": INSTRUMENT_DISPLAY,
         "signals": state.get("signals", []),
     })
+
+
+@app.route("/update_signal", methods=["POST", "OPTIONS"])
+def update_signal_endpoint():
+    """Write-back from the JP Signals app: save grade / notes / eye_agreement
+    onto an existing signal record by id. Only these user-editable fields can
+    be set here — detector and broker fields are never overwritten."""
+    from flask import request
+    if request.method == "OPTIONS":
+        return ("", 204)  # CORS preflight
+    data = request.get_json(silent=True) or {}
+    sid = data.get("id")
+    if not sid:
+        return jsonify({"ok": False, "error": "missing id"}), 400
+    rec = next((s for s in state.get("signals", []) if s["id"] == sid), None)
+    if not rec:
+        return jsonify({"ok": False, "error": "signal not found"}), 404
+
+    EDITABLE = {"grade", "eye_agreement", "notes"}
+    changed = {}
+    for field in EDITABLE:
+        if field in data:
+            val = data[field]
+            if field == "grade" and val not in ("A", "B", "C", None):
+                continue
+            if field == "eye_agreement" and val not in ("agree", "skip", None):
+                continue
+            rec[field] = val
+            changed[field] = val
+    if not changed:
+        return jsonify({"ok": False, "error": "no editable fields provided"}), 400
+    save_state()
+    # If a grade changed and we have the Telegram message, refresh its buttons.
+    if "grade" in changed and rec.get("telegram_message_id"):
+        edit_photo_markup(rec["telegram_message_id"],
+                          grade_keyboard(sid, selected=changed["grade"]))
+    log.info(f"UPDATE {sid}: {changed}")
+    return jsonify({"ok": True, "id": sid, "updated": changed, "signal": rec})
 
 
 @app.route("/test_functions")
@@ -613,6 +697,31 @@ def handle_command(text: str, chat_id: str):
     send_telegram_reply(chat_id, reply)
 
 
+def handle_grade_callback(cb: dict):
+    """Process an A/B/C grade button tap: write grade to the record (last tap
+    wins), refresh the buttons to show the selection, ack the tap."""
+    cb_id = cb.get("id")
+    data = cb.get("data", "")
+    parts = data.split("|")
+    if len(parts) != 3 or parts[0] != "grade":
+        if cb_id:
+            answer_callback(cb_id)
+        return
+    _, signal_id, grade = parts
+    rec = next((s for s in state.get("signals", []) if s["id"] == signal_id), None)
+    if not rec:
+        answer_callback(cb_id, "Signal not found")
+        return
+    rec["grade"] = grade            # last tap wins
+    save_state()
+    # Refresh buttons so the chosen grade shows as [A]/[B]/[C]
+    mid = rec.get("telegram_message_id")
+    if mid:
+        edit_photo_markup(mid, grade_keyboard(signal_id, selected=grade))
+    answer_callback(cb_id, f"Graded {grade}")
+    log.info(f"GRADE {signal_id} -> {grade}")
+
+
 def poll_telegram():
     if not TELEGRAM_TOKEN:
         log.warning("No TELEGRAM_TOKEN — polling disabled"); return
@@ -629,6 +738,11 @@ def poll_telegram():
                 continue
             for upd in r.json().get("result", []):
                 offset = upd["update_id"] + 1
+                # Button taps arrive as callback_query, not message
+                cb = upd.get("callback_query")
+                if cb:
+                    handle_grade_callback(cb)
+                    continue
                 msg = upd.get("message") or upd.get("channel_post")
                 if not msg:
                     continue
