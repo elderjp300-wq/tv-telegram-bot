@@ -78,7 +78,15 @@ ORDER_EXPIRY_HOURS = 24   # placed limit must tap within a day (automation rule)
 SCAN_INTERVAL_SECONDS = 15 * 60
 MAX_LOGGED_SIGNALS = 200
 
+# Runtime flags (paused, last scan, etc.) live in this small file — losing them
+# on a restart is harmless. SIGNALS live in Supabase (durable, survive restarts).
 STATE_FILE = "bot_state.json"
+
+# Supabase (durable signal storage). Set in Render env vars.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SUPABASE_TABLE = "signals"
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
 # =============================================================================
 # LOGGING
@@ -103,25 +111,92 @@ state: Dict[str, Any] = {
 }
 
 
+def _sb_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def sb_load_signals():
+    """Load all signals from Supabase, newest first. Returns list (or [] on error)."""
+    if not SUPABASE_ENABLED:
+        return []
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+            headers=_sb_headers(),
+            params={"select": "*", "order": "timestamp.desc", "limit": str(MAX_LOGGED_SIGNALS)},
+            timeout=15)
+        if r.ok:
+            return r.json()
+        log.error(f"sb_load_signals: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        log.error(f"sb_load_signals: {e}")
+    return []
+
+
+def sb_upsert_signal(record: Dict[str, Any]) -> bool:
+    """Insert or update one signal row by id (Supabase upsert via Prefer header)."""
+    if not SUPABASE_ENABLED:
+        return False
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+            headers={**_sb_headers(), "Prefer": "resolution=merge-duplicates"},
+            json=record, timeout=15)
+        if r.ok:
+            return True
+        log.error(f"sb_upsert_signal: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        log.error(f"sb_upsert_signal: {e}")
+    return False
+
+
 def load_state():
+    """Load runtime flags from the JSON file (ephemeral, fine to lose) and the
+    durable signals list from Supabase (survives restarts)."""
     global state
+    # 1. runtime flags from file
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
-                state.update(json.load(f))
-            log.info(f"State loaded: {len(state.get('signals', []))} signals")
+                flags = json.load(f)
+            # only adopt the small runtime flags, never an old signals list
+            for k in ("paused", "last_scan_ts", "last_2h_trend",
+                      "last_signal_ob_key", "signals_today", "today_date"):
+                if k in flags:
+                    state[k] = flags[k]
+            log.info("Runtime flags loaded from file")
         except Exception as e:
-            log.warning(f"Could not load state: {e}")
+            log.warning(f"Could not load flags: {e}")
+    # 2. durable signals from Supabase
+    if SUPABASE_ENABLED:
+        sigs = sb_load_signals()
+        state["signals"] = sigs
+        log.info(f"Loaded {len(sigs)} signals from Supabase")
+    else:
+        log.warning("Supabase not configured — signals will not persist!")
+
+
+def save_flags():
+    """Persist only the small runtime flags to the JSON file (NOT signals)."""
+    try:
+        flags = {k: state.get(k) for k in
+                 ("paused", "last_scan_ts", "last_2h_trend",
+                  "last_signal_ob_key", "signals_today", "today_date")}
+        with open(STATE_FILE, "w") as f:
+            json.dump(flags, f, indent=2, default=str)
+    except Exception as e:
+        log.error(f"save_flags: {e}")
 
 
 def save_state():
-    try:
-        if len(state["signals"]) > MAX_LOGGED_SIGNALS:
-            state["signals"] = state["signals"][-MAX_LOGGED_SIGNALS:]
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2, default=str)
-    except Exception as e:
-        log.error(f"save_state: {e}")
+    """Backward-compatible: persists runtime flags. Signals are saved per-row
+    via sb_upsert_signal at the moment they're created/updated, so this no
+    longer needs to write the whole signals list."""
+    save_flags()
 
 
 def reset_daily_counter():
@@ -509,7 +584,8 @@ def scan():
         state["signals"].append(record)
         state["last_signal_ob_key"] = key
         state["signals_today"] += 1
-        save_state()
+        sb_upsert_signal(record)   # durable: write this signal row to Supabase
+        save_state()               # runtime flags to file
 
         dir_label = "🟢 BUY" if bos["direction"] == "bullish" else "🔴 SELL"
         atr_line = f"\n<b>Risk in ATR:</b> {record['risk_atr']}x ATR" if record["risk_atr"] else ""
@@ -535,6 +611,7 @@ def scan():
                 reply_markup=grade_keyboard(signal_id))
             if msg_id:
                 record["telegram_message_id"] = msg_id
+                sb_upsert_signal(record)
                 save_state()
         log.info(f"SETUP {signal_id} ({bos['direction']}, 2H {trend_2h}, {record['session']})")
     except Exception as e:
@@ -558,11 +635,12 @@ def add_cors(resp):
 @app.route("/")
 def health():
     return jsonify({
-        "status": "ok", "bot": "JP Gold Bot v3.2 (detector)",
+        "status": "ok", "bot": "JP Gold Bot v3.2.4 (detector, supabase)",
         "paused": state.get("paused", False),
         "last_scan": state.get("last_scan_ts"),
         "last_2h_trend": state.get("last_2h_trend"),
         "signals_logged": len(state.get("signals", [])),
+        "supabase_enabled": SUPABASE_ENABLED,
         "in_session": in_tradeable_session(),
     })
 
@@ -606,6 +684,7 @@ def update_signal_endpoint():
             changed[field] = val
     if not changed:
         return jsonify({"ok": False, "error": "no editable fields provided"}), 400
+    sb_upsert_signal(rec)   # persist the edit durably
     save_state()
     # If a grade changed and we have the Telegram message, refresh its buttons.
     if "grade" in changed and rec.get("telegram_message_id"):
@@ -713,6 +792,7 @@ def handle_grade_callback(cb: dict):
         answer_callback(cb_id, "Signal not found")
         return
     rec["grade"] = grade            # last tap wins
+    sb_upsert_signal(rec)           # persist the grade durably
     save_state()
     # Refresh buttons so the chosen grade shows as [A]/[B]/[C]
     mid = rec.get("telegram_message_id")
