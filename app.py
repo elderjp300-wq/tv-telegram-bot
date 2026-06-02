@@ -123,6 +123,35 @@ def _sb_headers():
     }
 
 
+# Public Supabase Storage bucket that holds setup chart PNGs (so the web app
+# can display them). Created once in the Supabase dashboard; see deploy notes.
+SUPABASE_CHART_BUCKET = os.getenv("SUPABASE_CHART_BUCKET", "charts")
+
+
+def sb_upload_chart(signal_id: str, png_bytes: bytes) -> Optional[str]:
+    """Upload a chart PNG to the public Storage bucket and return its public
+    URL (or None on failure). Used to fill chart_url so the app can show it."""
+    if not SUPABASE_ENABLED or not png_bytes:
+        return None
+    fname = f"{signal_id}.png"
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_CHART_BUCKET}/{fname}",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "image/png",
+                "x-upsert": "true",   # overwrite if it already exists
+            },
+            data=png_bytes, timeout=20)
+        if r.ok:
+            return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_CHART_BUCKET}/{fname}"
+        log.error(f"sb_upload_chart: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        log.error(f"sb_upload_chart: {e}")
+    return None
+
+
 def sb_load_signals():
     """Load all signals from Supabase, newest first. Returns list (or [] on error)."""
     if not SUPABASE_ENABLED:
@@ -607,6 +636,10 @@ def scan():
 
         img = render_setup_chart(candles_15m, bos, ob, fvg, levels, trend_2h, signal_id)
         if img:
+            # Host the chart so the web app can show it, then tag the record.
+            chart_url = sb_upload_chart(signal_id, img)
+            if chart_url:
+                record["chart_url"] = chart_url
             msg_id = send_telegram_photo(
                 img, f"{INSTRUMENT_DISPLAY} {dir_label} | 2H: {trend_2h} | "
                      f"{record['session']} | E {record['entry']:.2f} / "
@@ -615,6 +648,8 @@ def scan():
                 reply_markup=grade_keyboard(signal_id))
             if msg_id:
                 record["telegram_message_id"] = msg_id
+            # one durable write covering chart_url and/or telegram_message_id
+            if chart_url or msg_id:
                 sb_upsert_signal(record)
                 save_state()
         log.info(f"SETUP {signal_id} ({bos['direction']}, 2H {trend_2h}, {record['session']})")
