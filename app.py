@@ -567,7 +567,12 @@ def build_record(signal_id, bos, ob, fvg, levels, trend_2h, atr) -> Dict:
 # =============================================================================
 def make_signal_id(t: str, direction: str) -> str:
     clean = t.replace(" ", "_").replace(":", "").replace("-", "")
-    return f"{clean}_{direction[0]}"
+    # NB: both "bullish" and "bearish" start with "b", so direction[0] alone
+    # was ambiguous — two same-minute setups of opposite direction would collide.
+    # Use a distinct 2-char suffix instead. (Old ids ending in "_b" remain valid;
+    # the worker matches trades by the full id, so historical records are unaffected.)
+    suffix = "bu" if direction == "bullish" else "be"
+    return f"{clean}_{suffix}"
 
 
 def scan():
