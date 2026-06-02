@@ -85,6 +85,10 @@ STATE_FILE = "bot_state.json"
 # Supabase (durable signal storage). Set in Render env vars.
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+# Shared secret the execution worker presents to write broker-truth outcome
+# fields back onto a signal. The public app never needs this (it only writes
+# grade/notes/eye_agreement). If unset, broker write-back is disabled.
+WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 SUPABASE_TABLE = "signals"
 SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
@@ -682,6 +686,33 @@ def update_signal_endpoint():
                 continue
             rec[field] = val
             changed[field] = val
+
+    # --- Broker-truth execution fields (Stage 4) -------------------------- #
+    # These are NOT user-editable. They may only be written by the execution
+    # worker, which proves itself with the shared WORKER_TOKEN. The public app
+    # can never set them. Each value is validated before it touches the record.
+    EXEC_FIELDS = {
+        "order_placed", "fill_status", "fill_price", "fill_time",
+        "outcome", "exit_price", "exit_time", "r_result", "lot_size", "pnl",
+    }
+    if any(f in data for f in EXEC_FIELDS):
+        presented = request.headers.get("X-Worker-Token") or data.get("worker_token")
+        if not WORKER_TOKEN or presented != WORKER_TOKEN:
+            return jsonify({"ok": False, "error": "execution fields require a valid worker token"}), 403
+        for field in EXEC_FIELDS:
+            if field not in data:
+                continue
+            val = data[field]
+            if field == "outcome" and val not in ("win", "loss", "breakeven", "no-fill", None):
+                continue
+            if field == "order_placed" and val not in (True, False, None):
+                continue
+            if field in ("fill_price", "exit_price", "r_result", "lot_size", "pnl") \
+                    and val is not None and not isinstance(val, (int, float)):
+                continue
+            rec[field] = val
+            changed[field] = val
+
     if not changed:
         return jsonify({"ok": False, "error": "no editable fields provided"}), 400
     sb_upsert_signal(rec)   # persist the edit durably
