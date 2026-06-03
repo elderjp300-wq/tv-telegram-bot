@@ -70,9 +70,16 @@ CANDLES_15M = 60
 
 # Strategy params
 SWING_LOOKBACK = 3
-SL_BUFFER_USD = 0.50
 RR_TARGET = 3.0
 ATR_PERIOD = 14
+# --- ATR-relative setup-quality rules (validated on 15m via the Pine verifier) ---
+# OB candle range must sit within [min..max] x ATR (any colour). FVG must clear a
+# minimum size. Stop sits beyond the OB far edge by a buffer x ATR. All ATR-relative
+# so they self-adjust to volatility; override via env if you tune them later.
+OB_MIN_ATR_MULT    = float(os.getenv("OB_MIN_ATR_MULT", "1.1"))
+OB_MAX_ATR_MULT    = float(os.getenv("OB_MAX_ATR_MULT", "2.6"))
+FVG_MIN_ATR_MULT   = float(os.getenv("FVG_MIN_ATR_MULT", "0.2"))
+SL_BUFFER_ATR_MULT = float(os.getenv("SL_BUFFER_ATR_MULT", "0.2"))
 ORDER_EXPIRY_HOURS = 24   # placed limit must tap within a day (automation rule)
 
 SCAN_INTERVAL_SECONDS = 15 * 60
@@ -336,36 +343,48 @@ def detect_bos(candles: List[Dict]) -> Optional[Dict]:
     return None
 
 
-def find_order_block(candles: List[Dict], bos: Dict) -> Optional[Dict]:
-    direction = bos["direction"]
+def find_order_block(candles: List[Dict], bos: Dict, atr: Optional[float]) -> Optional[Dict]:
+    # OB = FIRST candle (ANY colour) walking back from the BOS toward the broken
+    # swing whose range (high-low) sits within [OB_MIN..OB_MAX] x ATR. Colour no
+    # longer matters; size does — this rejects tiny/lifeless candles and oversized ones.
+    if not atr or atr <= 0:
+        return None
+    lo = OB_MIN_ATR_MULT * atr
+    hi = OB_MAX_ATR_MULT * atr
     for i in range(bos["bos_idx"] - 1, bos["broken_swing"]["idx"], -1):
         c = candles[i]
-        if direction == "bullish" and c["close"] < c["open"]:
-            return {"idx": i, **c}
-        if direction == "bearish" and c["close"] > c["open"]:
+        rng = c["high"] - c["low"]
+        if lo <= rng <= hi:
             return {"idx": i, **c}
     return None
 
 
-def find_fvg(candles: List[Dict], bos: Dict, ob_idx: int) -> Optional[Dict]:
+def find_fvg(candles: List[Dict], bos: Dict, ob_idx: int, atr: Optional[float]) -> Optional[Dict]:
     direction = bos["direction"]
+    min_gap = FVG_MIN_ATR_MULT * atr if atr and atr > 0 else 0.0
     for i in range(ob_idx, bos["bos_idx"] - 1):
         c1, c3 = candles[i], candles[i + 2]
         if direction == "bullish" and c1["high"] < c3["low"]:
-            return {"low": c1["high"], "high": c3["low"], "idx": i + 1}
+            if (c3["low"] - c1["high"]) >= min_gap:
+                return {"low": c1["high"], "high": c3["low"], "idx": i + 1}
         if direction == "bearish" and c1["low"] > c3["high"]:
-            return {"low": c3["high"], "high": c1["low"], "idx": i + 1}
+            if (c1["low"] - c3["high"]) >= min_gap:
+                return {"low": c3["high"], "high": c1["low"], "idx": i + 1}
     return None
 
 
-def compute_levels(direction: str, ob: Dict) -> Dict:
-    entry = ob["open"]
+def compute_levels(direction: str, ob: Dict, atr: Optional[float]) -> Dict:
+    # Entry at the NEAR edge of the OB (the edge price retraces to first); stop
+    # beyond the FAR edge by SL_BUFFER x ATR (protects against wicks).
+    buf = SL_BUFFER_ATR_MULT * atr if atr and atr > 0 else 0.0
     if direction == "bullish":
-        sl = ob["low"] - SL_BUFFER_USD
+        entry = ob["high"]          # buy retraces DOWN to the OB high
+        sl = ob["low"] - buf
         risk = entry - sl
         target = entry + RR_TARGET * risk
     else:
-        sl = ob["high"] + SL_BUFFER_USD
+        entry = ob["low"]           # sell retraces UP to the OB low
+        sl = ob["high"] + buf
         risk = sl - entry
         target = entry - RR_TARGET * risk
     return {"entry": entry, "sl": sl, "target": target, "risk": abs(entry - sl)}
@@ -587,6 +606,9 @@ def scan():
         candles_15m = fetch_candles(TF_15M, CANDLES_15M)
         if not candles_15m:
             return
+        atr = compute_atr(candles_15m)
+        if not atr or atr <= 0:
+            save_state(); return
         candles_2h = fetch_candles(TF_2H, CANDLES_2H)
         trend_2h = determine_trend(candles_2h) if candles_2h else "unknown"
         state["last_2h_trend"] = trend_2h
@@ -594,10 +616,10 @@ def scan():
         bos = detect_bos(candles_15m)
         if not bos:
             save_state(); return
-        ob = find_order_block(candles_15m, bos)
+        ob = find_order_block(candles_15m, bos, atr)
         if not ob:
             save_state(); return
-        fvg = find_fvg(candles_15m, bos, ob["idx"])
+        fvg = find_fvg(candles_15m, bos, ob["idx"], atr)
         if not fvg:
             log.info("BOS+OB but no FVG -> skip (FVG mandatory)")
             save_state(); return
@@ -606,7 +628,7 @@ def scan():
         if key == state.get("last_signal_ob_key"):
             return
 
-        levels = compute_levels(bos["direction"], ob)
+        levels = compute_levels(bos["direction"], ob, atr)
         if levels["risk"] <= 0:
             return
         bc = bos["bos_candle"]
@@ -615,7 +637,6 @@ def scan():
         if bos["direction"] == "bearish" and bc["high"] >= levels["sl"]:
             return
 
-        atr = compute_atr(candles_15m)
         signal_id = make_signal_id(bos["bos_candle"]["time"], bos["direction"])
         record = build_record(signal_id, bos, ob, fvg, levels, trend_2h, atr)
 
@@ -804,8 +825,10 @@ def handle_command(text: str, chat_id: str):
         reply = (f"<b>Config</b>\n"
                  f"Instrument: {INSTRUMENT_DISPLAY}\n"
                  f"Detection: 15M FVG-triggered (BOS+OB+mandatory FVG)\n"
+                 f"OB filter: {OB_MIN_ATR_MULT}-{OB_MAX_ATR_MULT}x ATR range (any colour)\n"
+                 f"FVG min: {FVG_MIN_ATR_MULT}x ATR\n"
                  f"2H trend: context only\n"
-                 f"Entry: OB · Stop: OB inval +${SL_BUFFER_USD} · Target: {RR_TARGET:.0f}R\n"
+                 f"Entry: OB near edge · Stop: OB far edge +{SL_BUFFER_ATR_MULT}x ATR · Target: {RR_TARGET:.0f}R\n"
                  f"ATR period: {ATR_PERIOD}\n"
                  f"Risk %: {RISK_PERCENT}% (for automation sizing)\n"
                  f"Order expiry: {ORDER_EXPIRY_HOURS}h\n"
