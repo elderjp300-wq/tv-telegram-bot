@@ -72,12 +72,12 @@ CANDLES_15M = 60
 SWING_LOOKBACK = 3
 RR_TARGET = 3.0
 ATR_PERIOD = 14
-# --- ATR-relative setup-quality rules (validated on 15m via the Pine verifier) ---
-# OB candle range must sit within [min..max] x ATR (any colour). FVG must clear a
-# minimum size. Stop sits beyond the OB far edge by a buffer x ATR. All ATR-relative
-# so they self-adjust to volatility; override via env if you tune them later.
-OB_MIN_ATR_MULT    = float(os.getenv("OB_MIN_ATR_MULT", "1.1"))
-OB_MAX_ATR_MULT    = float(os.getenv("OB_MAX_ATR_MULT", "2.6"))
+# --- Setup-quality rules ---
+# OB candle range gate is a FIXED DOLLAR window on (high-low), per JP: $2..$22.
+# FVG min size and the stop buffer stay ATR-relative (self-adjust to volatility).
+# All overridable via env if you tune them later.
+OB_MIN_USD         = float(os.getenv("OB_MIN_USD", "2.0"))
+OB_MAX_USD         = float(os.getenv("OB_MAX_USD", "22.0"))
 FVG_MIN_ATR_MULT   = float(os.getenv("FVG_MIN_ATR_MULT", "0.2"))
 SL_BUFFER_ATR_MULT = float(os.getenv("SL_BUFFER_ATR_MULT", "0.2"))
 ORDER_EXPIRY_HOURS = 24   # placed limit must tap within a day (automation rule)
@@ -343,18 +343,14 @@ def detect_bos(candles: List[Dict]) -> Optional[Dict]:
     return None
 
 
-def find_order_block(candles: List[Dict], bos: Dict, atr: Optional[float]) -> Optional[Dict]:
+def find_order_block(candles: List[Dict], bos: Dict) -> Optional[Dict]:
     # OB = FIRST candle (ANY colour) walking back from the BOS toward the broken
-    # swing whose range (high-low) sits within [OB_MIN..OB_MAX] x ATR. Colour no
-    # longer matters; size does — this rejects tiny/lifeless candles and oversized ones.
-    if not atr or atr <= 0:
-        return None
-    lo = OB_MIN_ATR_MULT * atr
-    hi = OB_MAX_ATR_MULT * atr
+    # swing whose range (high-low) sits inside the FIXED DOLLAR window
+    # [OB_MIN_USD .. OB_MAX_USD]. Rejects tiny/lifeless and oversized candles.
     for i in range(bos["bos_idx"] - 1, bos["broken_swing"]["idx"], -1):
         c = candles[i]
         rng = c["high"] - c["low"]
-        if lo <= rng <= hi:
+        if OB_MIN_USD <= rng <= OB_MAX_USD:
             return {"idx": i, **c}
     return None
 
@@ -616,7 +612,7 @@ def scan():
         bos = detect_bos(candles_15m)
         if not bos:
             save_state(); return
-        ob = find_order_block(candles_15m, bos, atr)
+        ob = find_order_block(candles_15m, bos)
         if not ob:
             save_state(); return
         fvg = find_fvg(candles_15m, bos, ob["idx"], atr)
@@ -825,7 +821,7 @@ def handle_command(text: str, chat_id: str):
         reply = (f"<b>Config</b>\n"
                  f"Instrument: {INSTRUMENT_DISPLAY}\n"
                  f"Detection: 15M FVG-triggered (BOS+OB+mandatory FVG)\n"
-                 f"OB filter: {OB_MIN_ATR_MULT}-{OB_MAX_ATR_MULT}x ATR range (any colour)\n"
+                 f"OB filter: ${OB_MIN_USD:.2f}-${OB_MAX_USD:.2f} high-low (any colour)\n"
                  f"FVG min: {FVG_MIN_ATR_MULT}x ATR\n"
                  f"2H trend: context only\n"
                  f"Entry: OB near edge · Stop: OB far edge +{SL_BUFFER_ATR_MULT}x ATR · Target: {RR_TARGET:.0f}R\n"
