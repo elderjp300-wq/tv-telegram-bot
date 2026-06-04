@@ -344,13 +344,20 @@ def detect_bos(candles: List[Dict]) -> Optional[Dict]:
 
 
 def find_order_block(candles: List[Dict], bos: Dict) -> Optional[Dict]:
-    # OB = FIRST candle (ANY colour) walking back from the BOS toward the broken
-    # swing whose range (high-low) sits inside the FIXED DOLLAR window
-    # [OB_MIN_USD .. OB_MAX_USD]. Rejects tiny/lifeless and oversized candles.
+    # OB = last OPPOSITE-colour candle before the BOS (bearish -> up candle,
+    # bullish -> down candle) whose range (high-low) sits in $OB_MIN..$OB_MAX.
+    # The colour rule anchors the OB at the move's ORIGIN, leaving room for the
+    # mandatory FVG between OB and BOS. (Dropping colour pulled the OB right up
+    # against the BOS, starved the FVG check, and silenced the bot.)
+    direction = bos["direction"]
     for i in range(bos["bos_idx"] - 1, bos["broken_swing"]["idx"], -1):
         c = candles[i]
         rng = c["high"] - c["low"]
-        if OB_MIN_USD <= rng <= OB_MAX_USD:
+        if not (OB_MIN_USD <= rng <= OB_MAX_USD):
+            continue
+        if direction == "bullish" and c["close"] < c["open"]:
+            return {"idx": i, **c}
+        if direction == "bearish" and c["close"] > c["open"]:
             return {"idx": i, **c}
     return None
 
@@ -590,48 +597,56 @@ def make_signal_id(t: str, direction: str) -> str:
     return f"{clean}_{suffix}"
 
 
+def _record_scan(reason: str):
+    """Record why a scan ended — visible via /diag and in logs — so silent
+    stretches explain themselves instead of needing guesswork."""
+    state["last_scan"] = {"at": datetime.now(timezone.utc).isoformat(), "reason": reason}
+    t = state.setdefault("scan_tally", {})
+    t[reason] = t.get(reason, 0) + 1
+    log.info(f"[scan] {reason}")
+
+
 def scan():
     try:
         if state.get("paused"):
-            return
+            _record_scan("paused"); return
         state["last_scan_ts"] = datetime.now(timezone.utc).isoformat()
         reset_daily_counter()
         if not in_tradeable_session():
-            return
+            _record_scan("outside tradeable session"); return
 
         candles_15m = fetch_candles(TF_15M, CANDLES_15M)
         if not candles_15m:
-            return
+            _record_scan("no 15m candles (feed)"); return
         atr = compute_atr(candles_15m)
         if not atr or atr <= 0:
-            save_state(); return
+            _record_scan("no ATR"); save_state(); return
         candles_2h = fetch_candles(TF_2H, CANDLES_2H)
         trend_2h = determine_trend(candles_2h) if candles_2h else "unknown"
         state["last_2h_trend"] = trend_2h
 
         bos = detect_bos(candles_15m)
         if not bos:
-            save_state(); return
+            _record_scan("no BOS"); save_state(); return
         ob = find_order_block(candles_15m, bos)
         if not ob:
-            save_state(); return
+            _record_scan("BOS ok, no valid OB ($2-$22, opposite-colour)"); save_state(); return
         fvg = find_fvg(candles_15m, bos, ob["idx"], atr)
         if not fvg:
-            log.info("BOS+OB but no FVG -> skip (FVG mandatory)")
-            save_state(); return
+            _record_scan("BOS+OB ok, no FVG (mandatory)"); save_state(); return
 
         key = ob_key(bos["direction"], ob)
         if key == state.get("last_signal_ob_key"):
-            return
+            _record_scan("duplicate (same OB as last signal)"); return
 
         levels = compute_levels(bos["direction"], ob, atr)
         if levels["risk"] <= 0:
-            return
+            _record_scan("invalid risk (<=0)"); return
         bc = bos["bos_candle"]
         if bos["direction"] == "bullish" and bc["low"] <= levels["sl"]:
-            return
+            _record_scan("stale: BOS candle already pierced SL"); return
         if bos["direction"] == "bearish" and bc["high"] >= levels["sl"]:
-            return
+            _record_scan("stale: BOS candle already pierced SL"); return
 
         signal_id = make_signal_id(bos["bos_candle"]["time"], bos["direction"])
         record = build_record(signal_id, bos, ob, fvg, levels, trend_2h, atr)
@@ -639,6 +654,7 @@ def scan():
         state["signals"].append(record)
         state["last_signal_ob_key"] = key
         state["signals_today"] += 1
+        _record_scan(f"SIGNAL fired: {signal_id}")
         sb_upsert_signal(record)   # durable: write this signal row to Supabase
         save_state()               # runtime flags to file
 
@@ -806,7 +822,7 @@ def handle_command(text: str, chat_id: str):
     if cmd in ("start", "help"):
         reply = ("JP Gold Bot v3.2 — Setup Detector\n\n"
                  "I detect 15M FVG setups, draw them, log them. I don't trade.\n\n"
-                 "/status /config /recent /test_functions /pause /resume")
+                 "/status /config /diag /recent /test_functions /pause /resume")
     elif cmd == "status":
         reply = (f"<b>v3.2 Detector — Status</b>\n\n"
                  f"Paused: {'YES' if state.get('paused') else 'no'}\n"
@@ -821,7 +837,7 @@ def handle_command(text: str, chat_id: str):
         reply = (f"<b>Config</b>\n"
                  f"Instrument: {INSTRUMENT_DISPLAY}\n"
                  f"Detection: 15M FVG-triggered (BOS+OB+mandatory FVG)\n"
-                 f"OB filter: ${OB_MIN_USD:.2f}-${OB_MAX_USD:.2f} high-low (any colour)\n"
+                 f"OB filter: ${OB_MIN_USD:.2f}-${OB_MAX_USD:.2f} high-low, opposite-colour\n"
                  f"FVG min: {FVG_MIN_ATR_MULT}x ATR\n"
                  f"2H trend: context only\n"
                  f"Entry: OB near edge · Stop: OB far edge +{SL_BUFFER_ATR_MULT}x ATR · Target: {RR_TARGET:.0f}R\n"
@@ -831,6 +847,19 @@ def handle_command(text: str, chat_id: str):
                  f"Scan: every {SCAN_INTERVAL_SECONDS // 60} min\n"
                  f"Sessions: {SESSION_START_UTC:02d}:00-{SESSION_END_UTC:02d}:00 UTC"
                  f"{' + Asia' if INCLUDE_ASIA else ''}")
+    elif cmd == "diag":
+        ls = state.get("last_scan") or {}
+        tally = state.get("scan_tally") or {}
+        if not ls and not tally:
+            reply = "No scans recorded yet — give it a scan cycle or two."
+        else:
+            last_line = (f"{ls.get('reason','?')}  ({ls.get('at','?')[11:19]} UTC)"
+                         if ls else "none yet")
+            tally_lines = "\n".join(f"  {n}× {r}" for r, n in
+                                    sorted(tally.items(), key=lambda kv: -kv[1]))
+            reply = (f"<b>Scan diagnostics</b>\n"
+                     f"Last scan: {last_line}\n\n"
+                     f"<b>Tally (since last restart):</b>\n{tally_lines}")
     elif cmd == "recent":
         sigs = state.get("signals", [])[-5:]
         if not sigs:
