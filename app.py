@@ -606,12 +606,186 @@ def _record_scan(reason: str):
     log.info(f"[scan] {reason}")
 
 
+# =============================================================================
+# SIMULATED EXECUTION ENGINE  (replaces MetaApi; costs modeled; research forward-test)
+# =============================================================================
+# One brain owns the whole trade lifecycle, so the books always reconcile:
+#   signal fires -> sim_pending -> (price taps entry) sim_filled
+#                -> (a candle hits TP/SL) sim_closed, P&L booked to virtual equity
+# Costs: $SIM_SPREAD round-trip (worsens entry) + $SIM_COMMISSION_PER_LOT round-turn.
+# No broker. Storage reuses the signals table; fill_status carries the sim lifecycle
+# (sim_pending/sim_filled/sim_closed/sim_expired) — values the old worker never wrote,
+# so equity (= SIM_START + sum(pnl of sim_closed)) can't be contaminated by old trades.
+SIM_ENABLED            = os.getenv("SIM_ENABLED", "false").lower() == "true"
+SIM_START_BALANCE      = float(os.getenv("SIM_START_BALANCE", "100000"))
+SIM_RISK_PCT           = float(os.getenv("SIM_RISK_PCT", "0.1"))
+SIM_SPREAD             = float(os.getenv("SIM_SPREAD", "0.30"))
+SIM_COMMISSION_PER_LOT = float(os.getenv("SIM_COMMISSION_PER_LOT", "7.0"))
+SIM_CONTRACT_SIZE      = float(os.getenv("SIM_CONTRACT_SIZE", "100"))   # oz per 1.0 lot
+SIM_CANDLES            = int(os.getenv("SIM_CANDLES", "130"))           # ~32h > 24h expiry
+
+
+def _sim_closed():
+    return [s for s in state.get("signals", []) if s.get("fill_status") == "sim_closed"]
+
+
+def _sim_equity():
+    return SIM_START_BALANCE + sum((s.get("pnl") or 0.0) for s in _sim_closed())
+
+
+def _sim_size_lot(entry, stop):
+    dist = abs(entry - stop)
+    if dist <= 0:
+        return 0.0
+    risk_dollars = _sim_equity() * (SIM_RISK_PCT / 100.0)
+    lot = round(risk_dollars / (dist * SIM_CONTRACT_SIZE), 2)
+    return max(0.01, lot)
+
+
+def sim_arm(record):
+    """Turn a freshly-fired signal into a pending sim trade (sized, not yet filled)."""
+    if not SIM_ENABLED:
+        return
+    record["fill_status"] = "sim_pending"
+    record["order_placed"] = True
+    record["lot_size"] = _sim_size_lot(record["entry"], record["stop"])
+
+
+def _sim_send_fill(s):
+    d = "🟢 BUY" if s["direction"] == "bullish" else "🔴 SELL"
+    send_telegram(f"✅ <b>ENTRY FILLED</b> · <code>{s['id']}</code>\n"
+                  f"{d} {INSTRUMENT_DISPLAY} @ {s['fill_price']:.2f}  ·  {s['lot_size']:.2f} lot\n"
+                  f"SL {s['stop']:.2f}  ·  TP {s['target']:.2f}  ·  risk {SIM_RISK_PCT}%")
+
+
+def _sim_send_exit(s):
+    win = s["outcome"] == "win"
+    head = "🎯 <b>TARGET HIT</b>" if win else "🛑 <b>STOP HIT</b>"
+    sign = "+" if (s["pnl"] or 0) >= 0 else ""
+    send_telegram(f"{head} · <code>{s['id']}</code>\n"
+                  f"exit {s['exit_price']:.2f}  ·  {sign}{s['r_result']:.2f}R  ·  {sign}${s['pnl']:.2f}\n"
+                  f"<b>Equity: ${_sim_equity():,.2f}</b>")
+
+
+def _book_exit(s, exit_price, outcome, exit_time):
+    fill, lot = s["fill_price"], s["lot_size"]
+    if s["direction"] == "bullish":
+        gross = (exit_price - fill) * SIM_CONTRACT_SIZE * lot
+    else:
+        gross = (fill - exit_price) * SIM_CONTRACT_SIZE * lot
+    pnl = gross - SIM_COMMISSION_PER_LOT * lot
+    risk_dollars = abs(fill - s["stop"]) * SIM_CONTRACT_SIZE * lot
+    r = (pnl / risk_dollars) if risk_dollars > 0 else 0.0
+    s.update(fill_status="sim_closed", outcome=outcome, exit_price=round(exit_price, 2),
+             exit_time=exit_time, pnl=round(pnl, 2), r_result=round(r, 2))
+
+
+def _scan_exit(s, candles, start_idx):
+    """Walk candles from start_idx; book the first SL/TP hit. If one candle spans
+    BOTH levels, assume SL first (pessimistic — right bias for prop eval). Returns
+    True if the trade closed."""
+    direction, stop, target = s["direction"], s["stop"], s["target"]
+    for c in candles[start_idx:]:
+        if direction == "bullish":
+            hit_sl, hit_tp = c["low"] <= stop, c["high"] >= target
+        else:
+            hit_sl, hit_tp = c["high"] >= stop, c["low"] <= target
+        if hit_sl:
+            _book_exit(s, stop, "loss", c["time"]); return True
+        if hit_tp:
+            _book_exit(s, target, "win", c["time"]); return True
+    return False
+
+
+def sim_tick():
+    """Advance every live sim trade against the latest candles. Runs each scan,
+    regardless of session, so open trades are monitored 24/5."""
+    if not SIM_ENABLED:
+        return
+    live = [s for s in state.get("signals", [])
+            if s.get("fill_status") in ("sim_pending", "sim_filled")]
+    if not live:
+        return
+    candles = fetch_candles(TF_15M, SIM_CANDLES)
+    if not candles:
+        return
+    now = datetime.now(timezone.utc)
+    for s in live:
+        direction, entry = s["direction"], s["entry"]
+        ref = s.get("bos_time") or ""
+        if s["fill_status"] == "sim_pending":
+            filled_idx = None
+            for i, c in enumerate(candles):
+                if c["time"] <= ref:
+                    continue
+                tapped = ((direction == "bullish" and c["low"] <= entry) or
+                          (direction == "bearish" and c["high"] >= entry))
+                if tapped:
+                    eff = entry + SIM_SPREAD if direction == "bullish" else entry - SIM_SPREAD
+                    s.update(fill_status="sim_filled", fill_price=round(eff, 2), fill_time=c["time"])
+                    _sim_send_fill(s)
+                    filled_idx = i
+                    break
+            if filled_idx is None:
+                try:
+                    created = datetime.fromisoformat(s.get("timestamp"))
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                except Exception:
+                    created = now
+                if (now - created).total_seconds() > ORDER_EXPIRY_HOURS * 3600:
+                    s.update(fill_status="sim_expired", outcome="no-fill")
+                    sb_upsert_signal(s)
+                    send_telegram(f"⌛ <b>EXPIRED</b> (no fill) · <code>{s['id']}</code>")
+                else:
+                    sb_upsert_signal(s)
+                continue
+            # same pass: the fill candle and after may also resolve the trade
+            closed = _scan_exit(s, candles, start_idx=filled_idx)
+            sb_upsert_signal(s)
+            if closed:
+                _sim_send_exit(s)
+            continue
+        if s["fill_status"] == "sim_filled":
+            ft = s.get("fill_time") or ""
+            start_idx = next((i for i, c in enumerate(candles) if c["time"] > ft), len(candles))
+            closed = _scan_exit(s, candles, start_idx=start_idx)
+            sb_upsert_signal(s)
+            if closed:
+                _sim_send_exit(s)
+
+
+def _sim_stats_text():
+    closed = _sim_closed()
+    wins = [s for s in closed if s.get("outcome") == "win"]
+    losses = [s for s in closed if s.get("outcome") == "loss"]
+    sigs = state.get("signals", [])
+    pending = sum(1 for s in sigs if s.get("fill_status") == "sim_pending")
+    openn = sum(1 for s in sigs if s.get("fill_status") == "sim_filled")
+    eq = _sim_equity()
+    pnl = eq - SIM_START_BALANCE
+    wr = (len(wins) / len(closed) * 100) if closed else 0.0
+    total_r = sum((s.get("r_result") or 0) for s in closed)
+    sign = "+" if pnl >= 0 else ""
+    return (f"<b>📊 Simulated account</b>\n"
+            f"Equity: <b>${eq:,.2f}</b>  ({sign}${pnl:,.2f})\n"
+            f"Start: ${SIM_START_BALANCE:,.0f} · risk {SIM_RISK_PCT}%/trade\n"
+            f"Closed: {len(closed)} · W {len(wins)} / L {len(losses)} · win {wr:.0f}%\n"
+            f"Net R: {total_r:+.2f}\n"
+            f"Open: {openn} · Pending: {pending}\n"
+            f"Costs modeled: ${SIM_SPREAD:.2f} spread + ${SIM_COMMISSION_PER_LOT:.0f}/lot")
+
+
 def scan():
     try:
         if state.get("paused"):
             _record_scan("paused"); return
         state["last_scan_ts"] = datetime.now(timezone.utc).isoformat()
         reset_daily_counter()
+        try:
+            sim_tick()   # advance live sim trades every scan, in or out of session
+        except Exception as e:
+            log.error(f"sim_tick: {e}")
         if not in_tradeable_session():
             _record_scan("outside tradeable session"); return
 
@@ -650,6 +824,7 @@ def scan():
 
         signal_id = make_signal_id(bos["bos_candle"]["time"], bos["direction"])
         record = build_record(signal_id, bos, ob, fvg, levels, trend_2h, atr)
+        sim_arm(record)            # mark as a pending sim trade + size it (if SIM_ENABLED)
 
         state["signals"].append(record)
         state["last_signal_ob_key"] = key
@@ -822,7 +997,7 @@ def handle_command(text: str, chat_id: str):
     if cmd in ("start", "help"):
         reply = ("JP Gold Bot v3.2 — Setup Detector\n\n"
                  "I detect 15M FVG setups, draw them, log them. I don't trade.\n\n"
-                 "/status /config /diag /recent /test_functions /pause /resume")
+                 "/status /config /sim /diag /recent /test_functions /pause /resume")
     elif cmd == "status":
         reply = (f"<b>v3.2 Detector — Status</b>\n\n"
                  f"Paused: {'YES' if state.get('paused') else 'no'}\n"
@@ -860,6 +1035,8 @@ def handle_command(text: str, chat_id: str):
             reply = (f"<b>Scan diagnostics</b>\n"
                      f"Last scan: {last_line}\n\n"
                      f"<b>Tally (since last restart):</b>\n{tally_lines}")
+    elif cmd in ("sim", "account"):
+        reply = _sim_stats_text() if SIM_ENABLED else "Simulator is OFF (set SIM_ENABLED=true)."
     elif cmd == "recent":
         sigs = state.get("signals", [])[-5:]
         if not sigs:
