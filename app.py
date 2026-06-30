@@ -420,97 +420,103 @@ def in_tradeable_session() -> bool:
 # =============================================================================
 # CHART
 # =============================================================================
+# ---- chart styling (clean dark, no gridlines, shaded OB/FVG, labelled levels) ----
+_C_BG, _C_UP, _C_DN = "#15171c", "#26a69a", "#ef5350"
+_C_TXT, _C_DIM = "#d8d8dd", "#6b6f76"
+_C_ENTRY, _C_SL, _C_TP = "#cfcfd4", "#ef5350", "#42a5f5"
+_C_OB, _C_FVG = "#c8a24c", "#5e9b8b"   # gold-ish OB, teal-ish FVG
+
+
+def _chart_ax():
+    fig, ax = plt.subplots(figsize=(8, 4.8), dpi=140)
+    fig.patch.set_facecolor(_C_BG); ax.set_facecolor(_C_BG)
+    ax.grid(False)
+    for sp in ax.spines.values():
+        sp.set_color("#2a2d34")
+    ax.tick_params(colors=_C_DIM, labelsize=7)
+    return fig, ax
+
+
+def _draw_candles(ax, window):
+    for n, c in enumerate(window):
+        col = _C_UP if c["close"] >= c["open"] else _C_DN
+        ax.plot([n, n], [c["low"], c["high"]], color=col, linewidth=1.0,
+                zorder=3, solid_capstyle="round")
+        lo, hi = min(c["open"], c["close"]), max(c["open"], c["close"])
+        ax.add_patch(Rectangle((n - 0.32, lo), 0.64, max(hi - lo, 0.012),
+                               facecolor=col, edgecolor=col, linewidth=0, zorder=4))
+
+
+def _band(ax, width, lo, hi, color, label):
+    if lo is None or hi is None:
+        return
+    ax.add_patch(Rectangle((0, lo), width, max(hi - lo, 0.012), facecolor=color,
+                           alpha=0.15, edgecolor=color, linewidth=1.0, zorder=1))
+    ax.text(0.4, hi, f" {label}", color=color, fontsize=7.5, fontweight="bold",
+            va="bottom", ha="left", zorder=6, alpha=0.95)
+
+
+def _level(ax, width, y, color, label):
+    ax.axhline(y, color=color, linestyle=(0, (5, 3)), linewidth=1.2, zorder=5, alpha=0.95)
+    ax.text(width - 0.4, y, f"{label} {y:.2f} ", color=color, fontsize=7.5, va="center",
+            ha="right", zorder=7,
+            bbox=dict(boxstyle="round,pad=0.22", fc=_C_BG, ec=color, lw=0.8, alpha=0.92))
+
+
+def _chart_finish(fig, ax, width, title):
+    ax.set_title(title, color=_C_TXT, fontsize=10.5, loc="left", pad=8, fontweight="bold")
+    ax.set_xlim(-1, width + 0.5); ax.margins(y=0.13); ax.set_xticks([])
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig); buf.seek(0)
+    return buf.read()
+
+
 def render_setup_chart(candles, bos, ob, fvg, levels, trend_2h, signal_id) -> Optional[bytes]:
     try:
         window = candles[-40:] if len(candles) > 40 else candles
-        base = len(candles) - len(window)
-        fig, ax = plt.subplots(figsize=(9, 5.5), dpi=110)
-        fig.patch.set_facecolor("#1e1e1e"); ax.set_facecolor("#1e1e1e")
-        for n, c in enumerate(window):
-            up = c["close"] >= c["open"]
-            col = "#81b29a" if up else "#e07a5f"
-            ax.plot([n, n], [c["low"], c["high"]], color=col, linewidth=0.8, zorder=2)
-            lo, hi = min(c["open"], c["close"]), max(c["open"], c["close"])
-            ax.add_patch(Rectangle((n - 0.3, lo), 0.6, max(hi - lo, 0.01),
-                                   facecolor=col, edgecolor=col, zorder=3))
-        ob_x = max(ob["idx"] - base, 0)
-        ax.add_patch(Rectangle((ob_x - 0.4, ob["low"]), (len(window) - ob_x) + 0.4,
-                               ob["high"] - ob["low"], facecolor="#3a3a52",
-                               alpha=0.35, edgecolor="none", zorder=1))
+        w = len(window)
+        fig, ax = _chart_ax()
         if fvg:
-            ax.add_patch(Rectangle((0, fvg["low"]), len(window), fvg["high"] - fvg["low"],
-                                   facecolor="#2d4a4a", alpha=0.25, edgecolor="none", zorder=1))
-        ax.axhline(levels["entry"], color="#bfbfbf", linestyle="--", linewidth=1.2,
-                   zorder=4, label=f"Entry {levels['entry']:.2f}")
-        ax.axhline(levels["sl"], color="#e07a5f", linestyle="--", linewidth=1.2,
-                   zorder=4, label=f"Stop {levels['sl']:.2f}")
-        ax.axhline(levels["target"], color="#6699cc", linestyle="--", linewidth=1.2,
-                   zorder=4, label=f"3R {levels['target']:.2f}")
-        ax.set_title(f"{INSTRUMENT_DISPLAY}  {bos['direction'].upper()}  |  "
-                     f"2H trend: {trend_2h}  |  {signal_id}",
-                     color="#e0e0e0", fontsize=10)
-        ax.tick_params(colors="#8e8e93", labelsize=7)
-        for s in ax.spines.values():
-            s.set_color("#333333")
-        ax.legend(loc="upper left", fontsize=7, facecolor="#252526",
-                  edgecolor="#333333", labelcolor="#e0e0e0")
-        ax.set_xlim(-1, len(window)); ax.margins(y=0.1)
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
-        plt.close(fig); buf.seek(0)
-        return buf.read()
+            _band(ax, w, fvg["low"], fvg["high"], _C_FVG, "FVG")
+        if ob:
+            _band(ax, w, ob["low"], ob["high"], _C_OB, "OB")
+        _draw_candles(ax, window)
+        _level(ax, w, levels["entry"], _C_ENTRY, "Entry")
+        _level(ax, w, levels["sl"], _C_SL, "SL")
+        _level(ax, w, levels["target"], _C_TP, "TP")
+        return _chart_finish(fig, ax, w,
+                             f"{INSTRUMENT_DISPLAY}  ·  {bos['direction'].upper()}  ·  2H {trend_2h}")
     except Exception as e:
         log.error(f"chart: {e}"); plt.close("all"); return None
 
 
 def render_exit_chart(candles, s) -> Optional[bytes]:
-    """Re-render how price played out: recent candles + the three levels, with the
-    fill and exit points marked and the outcome titled. No OB/FVG boxes — this chart
-    answers 'how did it resolve', not 'why was it taken'."""
+    """Same clean style as the setup chart, plus fill/exit markers and outcome.
+    OB/FVG bands come from the stored specs so the resolved chart keeps full context."""
     try:
         window = candles[-40:] if len(candles) > 40 else candles
+        w = len(window)
+        sp = s.get("specs") or {}
+        fig, ax = _chart_ax()
+        _band(ax, w, sp.get("fvg_low"), sp.get("fvg_high"), _C_FVG, "FVG")
+        _band(ax, w, sp.get("ob_low"), sp.get("ob_high"), _C_OB, "OB")
+        _draw_candles(ax, window)
+        _level(ax, w, s["entry"], _C_ENTRY, "Entry")
+        _level(ax, w, s["stop"], _C_SL, "SL")
+        _level(ax, w, s["target"], _C_TP, "TP")
         fill_t, exit_t = s.get("fill_time"), s.get("exit_time")
-        fig, ax = plt.subplots(figsize=(9, 5.5), dpi=110)
-        fig.patch.set_facecolor("#1e1e1e"); ax.set_facecolor("#1e1e1e")
-        fill_x = exit_x = None
         for n, c in enumerate(window):
-            up = c["close"] >= c["open"]
-            col = "#81b29a" if up else "#e07a5f"
-            ax.plot([n, n], [c["low"], c["high"]], color=col, linewidth=0.8, zorder=2)
-            lo, hi = min(c["open"], c["close"]), max(c["open"], c["close"])
-            ax.add_patch(Rectangle((n - 0.3, lo), 0.6, max(hi - lo, 0.01),
-                                   facecolor=col, edgecolor=col, zorder=3))
-            if c["time"] == fill_t:
-                fill_x = n
-            if c["time"] == exit_t:
-                exit_x = n
-        ax.axhline(s["entry"], color="#bfbfbf", linestyle="--", linewidth=1.1,
-                   zorder=4, label=f"Entry {s['entry']:.2f}")
-        ax.axhline(s["stop"], color="#e07a5f", linestyle="--", linewidth=1.1,
-                   zorder=4, label=f"Stop {s['stop']:.2f}")
-        ax.axhline(s["target"], color="#6699cc", linestyle="--", linewidth=1.1,
-                   zorder=4, label=f"Target {s['target']:.2f}")
-        if fill_x is not None and s.get("fill_price"):
-            ax.scatter([fill_x], [s["fill_price"]], marker="^", s=90,
-                       color="#e0e0e0", zorder=6, label="Fill")
-        if exit_x is not None and s.get("exit_price"):
-            win = s.get("outcome") == "win"
-            ax.scatter([exit_x], [s["exit_price"]], marker="X", s=110,
-                       color="#6699cc" if win else "#e07a5f", zorder=6, label="Exit")
-        outcome = (s.get("outcome") or "").upper()
-        ax.set_title(f"{INSTRUMENT_DISPLAY}  {s['direction'].upper()}  |  {outcome}  |  "
-                     f"{(s.get('r_result') or 0):+.2f}R  |  {s['id']}",
-                     color="#e0e0e0", fontsize=10)
-        ax.tick_params(colors="#8e8e93", labelsize=7)
-        for sp in ax.spines.values():
-            sp.set_color("#333333")
-        ax.legend(loc="upper left", fontsize=7, facecolor="#252526",
-                  edgecolor="#333333", labelcolor="#e0e0e0")
-        ax.set_xlim(-1, len(window)); ax.margins(y=0.1)
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
-        plt.close(fig); buf.seek(0)
-        return buf.read()
+            if c["time"] == fill_t and s.get("fill_price"):
+                ax.scatter([n], [s["fill_price"]], marker="^", s=80, color=_C_TXT,
+                           edgecolor=_C_BG, linewidth=0.7, zorder=8)
+            if c["time"] == exit_t and s.get("exit_price"):
+                win = s.get("outcome") == "win"
+                ax.scatter([n], [s["exit_price"]], marker="X", s=105,
+                           color=_C_TP if win else _C_SL, edgecolor=_C_BG, linewidth=0.7, zorder=8)
+        oc = (s.get("outcome") or "").upper(); r = s.get("r_result") or 0.0
+        return _chart_finish(fig, ax, w,
+                             f"{INSTRUMENT_DISPLAY}  ·  {s['direction'].upper()}  ·  {oc} {r:+.2f}R")
     except Exception as e:
         log.error(f"exit chart: {e}"); plt.close("all"); return None
 
@@ -759,6 +765,11 @@ def _build_specs(record, ob, fvg, atr):
         "session": record.get("session"),
         "trend_2h": record.get("trend_2h"),
         "rr_target": record.get("rr_target"),
+        # OB/FVG price bounds — DB-only, used to redraw bands on the exit chart
+        "ob_low": round(ob["low"], 2) if ob else None,
+        "ob_high": round(ob["high"], 2) if ob else None,
+        "fvg_low": round(fvg["low"], 2) if fvg else None,
+        "fvg_high": round(fvg["high"], 2) if fvg else None,
         # --- enriched when the trade closes ---
         "bars_in_trade": None,
         "mae_r": None,   # worst adverse excursion, in R (how close it came to stopping)
@@ -1001,7 +1012,7 @@ def scan():
         state["signals"].append(record)
         state["last_signal_ob_key"] = key
         state["signals_today"] += 1
-        _record_scan(f"SIGNAL fired: {signal_id}")
+        _record_scan("SIGNAL fired")
         sb_upsert_signal(record)   # durable: write this signal row to Supabase
         save_state()               # runtime flags to file
 
@@ -1189,6 +1200,16 @@ def handle_command(text: str, chat_id: str):
             reply = (f"<b>Scan diagnostics</b>\n"
                      f"Last scan: {last_line}\n\n"
                      f"<b>Tally (since last restart):</b>\n{tally_lines}")
+        # Move 3: skipped trades — fired a setup but never filled (24h curfew).
+        # Only IDs surface here; the full specs live in the DB for pattern-mining.
+        skipped = [s for s in state.get("signals", []) if s.get("fill_status") == "sim_expired"]
+        if skipped:
+            recent = skipped[-12:]
+            sk = "\n".join(f"  <code>{s['id']}</code> · {_session_full(s.get('session'))}"
+                           f" · {(s.get('trend_2h') or '—')}" for s in recent)
+            more = f"\n  …and {len(skipped) - 12} earlier" if len(skipped) > 12 else ""
+            reply += (f"\n\n<b>⌛ Skipped — expired, no fill ({len(skipped)}):</b>\n"
+                      f"{sk}{more}")
     elif cmd in ("sim", "account"):
         reply = _sim_stats_text() if SIM_ENABLED else "Simulator is OFF (set SIM_ENABLED=true)."
     elif cmd == "recent":
