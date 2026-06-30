@@ -463,6 +463,58 @@ def render_setup_chart(candles, bos, ob, fvg, levels, trend_2h, signal_id) -> Op
         log.error(f"chart: {e}"); plt.close("all"); return None
 
 
+def render_exit_chart(candles, s) -> Optional[bytes]:
+    """Re-render how price played out: recent candles + the three levels, with the
+    fill and exit points marked and the outcome titled. No OB/FVG boxes — this chart
+    answers 'how did it resolve', not 'why was it taken'."""
+    try:
+        window = candles[-40:] if len(candles) > 40 else candles
+        fill_t, exit_t = s.get("fill_time"), s.get("exit_time")
+        fig, ax = plt.subplots(figsize=(9, 5.5), dpi=110)
+        fig.patch.set_facecolor("#1e1e1e"); ax.set_facecolor("#1e1e1e")
+        fill_x = exit_x = None
+        for n, c in enumerate(window):
+            up = c["close"] >= c["open"]
+            col = "#81b29a" if up else "#e07a5f"
+            ax.plot([n, n], [c["low"], c["high"]], color=col, linewidth=0.8, zorder=2)
+            lo, hi = min(c["open"], c["close"]), max(c["open"], c["close"])
+            ax.add_patch(Rectangle((n - 0.3, lo), 0.6, max(hi - lo, 0.01),
+                                   facecolor=col, edgecolor=col, zorder=3))
+            if c["time"] == fill_t:
+                fill_x = n
+            if c["time"] == exit_t:
+                exit_x = n
+        ax.axhline(s["entry"], color="#bfbfbf", linestyle="--", linewidth=1.1,
+                   zorder=4, label=f"Entry {s['entry']:.2f}")
+        ax.axhline(s["stop"], color="#e07a5f", linestyle="--", linewidth=1.1,
+                   zorder=4, label=f"Stop {s['stop']:.2f}")
+        ax.axhline(s["target"], color="#6699cc", linestyle="--", linewidth=1.1,
+                   zorder=4, label=f"Target {s['target']:.2f}")
+        if fill_x is not None and s.get("fill_price"):
+            ax.scatter([fill_x], [s["fill_price"]], marker="^", s=90,
+                       color="#e0e0e0", zorder=6, label="Fill")
+        if exit_x is not None and s.get("exit_price"):
+            win = s.get("outcome") == "win"
+            ax.scatter([exit_x], [s["exit_price"]], marker="X", s=110,
+                       color="#6699cc" if win else "#e07a5f", zorder=6, label="Exit")
+        outcome = (s.get("outcome") or "").upper()
+        ax.set_title(f"{INSTRUMENT_DISPLAY}  {s['direction'].upper()}  |  {outcome}  |  "
+                     f"{(s.get('r_result') or 0):+.2f}R  |  {s['id']}",
+                     color="#e0e0e0", fontsize=10)
+        ax.tick_params(colors="#8e8e93", labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_color("#333333")
+        ax.legend(loc="upper left", fontsize=7, facecolor="#252526",
+                  edgecolor="#333333", labelcolor="#e0e0e0")
+        ax.set_xlim(-1, len(window)); ax.margins(y=0.1)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
+        plt.close(fig); buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        log.error(f"exit chart: {e}"); plt.close("all"); return None
+
+
 # =============================================================================
 # TELEGRAM
 # =============================================================================
@@ -505,6 +557,22 @@ def send_telegram_photo(image: bytes, caption: str, reply_markup: Optional[dict]
             return r.json().get("result", {}).get("message_id")
     except Exception as e:
         log.error(f"send_photo: {e}")
+    return None
+
+
+def send_telegram_photo_url(url: str, caption: str):
+    """Send a Telegram photo by URL (the chart is already hosted on Supabase),
+    so the entry card carries the setup image without re-rendering."""
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return None
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                          json={"chat_id": TELEGRAM_CHAT_ID, "photo": url,
+                                "caption": caption[:1000], "parse_mode": "HTML"}, timeout=20)
+        if r.ok:
+            return r.json().get("result", {}).get("message_id")
+    except Exception as e:
+        log.error(f"send_photo_url: {e}")
     return None
 
 
@@ -651,23 +719,112 @@ def sim_arm(record):
     record["lot_size"] = _sim_size_lot(record["entry"], record["stop"])
 
 
-def _sim_send_fill(s):
+_SESSION_FULL = {"NY": "New York", "London": "London", "Asia": "Asia", "Tokyo": "Tokyo"}
+
+
+def _session_full(code):
+    return _SESSION_FULL.get(code, code or "—")
+
+
+def _fmt_row(label, value):
+    return f"{label:<10}{value}"
+
+
+def _fmt_when(s):
+    t = s.get("bos_time") or ""
+    try:
+        return datetime.strptime(t, "%Y-%m-%d %H:%M:%S").strftime("%d %b %Y • %H:%M UTC")
+    except Exception:
+        return t
+
+
+def _build_specs(record, ob, fvg, atr):
+    """A compact, structured fingerprint of the setup — DB-only, never displayed.
+    Joined with the trade's outcome later, this is how we mine winners vs losers."""
+    def per_atr(x):
+        return round(x / atr, 2) if (atr and x is not None) else None
+    ob_sz = abs(ob["high"] - ob["low"]) if ob else None
+    fvg_sz = abs(fvg["high"] - fvg["low"]) if fvg else None
+    return {
+        "trade_id": record["id"],
+        "setup": "BOS+OB+FVG",
+        "direction": record["direction"],
+        "atr": round(atr, 2) if atr else None,
+        "ob_size_usd": round(ob_sz, 2) if ob_sz is not None else None,
+        "ob_size_atr": per_atr(ob_sz),
+        "fvg_size_usd": round(fvg_sz, 2) if fvg_sz is not None else None,
+        "fvg_size_atr": per_atr(fvg_sz),
+        "stop_dist_usd": record.get("risk_distance"),
+        "stop_dist_atr": record.get("risk_atr"),
+        "session": record.get("session"),
+        "trend_2h": record.get("trend_2h"),
+        "rr_target": record.get("rr_target"),
+        # --- enriched when the trade closes ---
+        "bars_in_trade": None,
+        "mae_r": None,   # worst adverse excursion, in R (how close it came to stopping)
+        "mfe_r": None,   # best favorable excursion, in R (how far it ran our way)
+    }
+
+
+def _entry_card(s):
     d = "🟢 BUY" if s["direction"] == "bullish" else "🔴 SELL"
-    send_telegram(f"✅ <b>ENTRY FILLED</b> · <code>{s['id']}</code>\n"
-                  f"{d} {INSTRUMENT_DISPLAY} @ {s['fill_price']:.2f}  ·  {s['lot_size']:.2f} lot\n"
-                  f"SL {s['stop']:.2f}  ·  TP {s['target']:.2f}  ·  risk {SIM_RISK_PCT}%")
+    block = "\n".join([
+        _fmt_row("Entry", f"{s['entry']:.2f}"),
+        _fmt_row("Stop", f"{s['stop']:.2f}"),
+        _fmt_row("Target", f"{s['target']:.2f}"),
+        _fmt_row("RR", f"{(s.get('rr_target') or RR_TARGET):.2f}R"),
+        "",
+        _fmt_row("Trend", (s.get("trend_2h") or "—").title()),
+        _fmt_row("Session", _session_full(s.get("session"))),
+        _fmt_row("ATR Risk", f"{s.get('risk_atr', '—')}×"),
+        "",
+        _fmt_row("Status", f"FILLED @ {s['fill_price']:.2f}"),
+        _fmt_row("Lot", f"{s['lot_size']:.2f}"),
+    ])
+    return (f"{d} · {INSTRUMENT_DISPLAY}\n<code>{s['id']}</code>\n\n"
+            f"<pre>{block}</pre>\n{_fmt_when(s)}")
 
 
-def _sim_send_exit(s):
+def _exit_card(s):
     win = s["outcome"] == "win"
-    head = "🎯 <b>TARGET HIT</b>" if win else "🛑 <b>STOP HIT</b>"
-    sign = "+" if (s["pnl"] or 0) >= 0 else ""
-    send_telegram(f"{head} · <code>{s['id']}</code>\n"
-                  f"exit {s['exit_price']:.2f}  ·  {sign}{s['r_result']:.2f}R  ·  {sign}${s['pnl']:.2f}\n"
-                  f"<b>Equity: ${_sim_equity():,.2f}</b>")
+    head = "🎯 TARGET HIT" if win else "🛑 STOP HIT"
+    sign = "+" if (s.get("pnl") or 0) >= 0 else ""
+    block = "\n".join([
+        _fmt_row("Entry", f"{s['fill_price']:.2f}"),
+        _fmt_row("Exit", f"{s['exit_price']:.2f}"),
+        _fmt_row("Result", f"{sign}{s['r_result']:.2f}R"),
+        _fmt_row("P&L", f"{sign}${s['pnl']:,.2f}"),
+        "",
+        _fmt_row("Trend", (s.get("trend_2h") or "—").title()),
+        _fmt_row("Session", _session_full(s.get("session"))),
+        "",
+        _fmt_row("Status", head.split(" ", 1)[1]),
+        _fmt_row("Equity", f"${_sim_equity():,.2f}"),
+    ])
+    return (f"{head} · {INSTRUMENT_DISPLAY}\n<code>{s['id']}</code>\n\n"
+            f"<pre>{block}</pre>\n{_fmt_when(s)}")
 
 
-def _book_exit(s, exit_price, outcome, exit_time):
+def _sim_send_fill(s):
+    """Entry card. Carries the hosted setup image if we have it, else text-only."""
+    card = _entry_card(s)
+    url = s.get("chart_url")
+    if url:
+        if send_telegram_photo_url(url, card):
+            return
+    send_telegram(card)
+
+
+def _sim_send_exit(s, candles):
+    """Exit card with a freshly-rendered chart of how price played out."""
+    card = _exit_card(s)
+    img = render_exit_chart(candles, s) if candles else None
+    if img and send_telegram_photo(img, card):
+        return
+    send_telegram(card)
+
+
+def _book_exit(s, exit_price, outcome, exit_time, mae_r=None, mfe_r=None, bars=None):
     fill, lot = s["fill_price"], s["lot_size"]
     if s["direction"] == "bullish":
         gross = (exit_price - fill) * SIM_CONTRACT_SIZE * lot
@@ -678,22 +835,37 @@ def _book_exit(s, exit_price, outcome, exit_time):
     r = (pnl / risk_dollars) if risk_dollars > 0 else 0.0
     s.update(fill_status="sim_closed", outcome=outcome, exit_price=round(exit_price, 2),
              exit_time=exit_time, pnl=round(pnl, 2), r_result=round(r, 2))
+    specs = s.get("specs") or {}
+    specs.update(bars_in_trade=bars, mae_r=mae_r, mfe_r=mfe_r)
+    s["specs"] = specs
 
 
 def _scan_exit(s, candles, start_idx):
-    """Walk candles from start_idx; book the first SL/TP hit. If one candle spans
-    BOTH levels, assume SL first (pessimistic — right bias for prop eval). Returns
-    True if the trade closed."""
+    """Walk candles from start_idx; book the first SL/TP hit (SL first if a candle
+    spans both — pessimistic). Tracks MAE/MFE in R along the way. Returns True if
+    the trade closed."""
     direction, stop, target = s["direction"], s["stop"], s["target"]
+    fill = s.get("fill_price") or s["entry"]
+    stop_dist = abs(fill - stop) or 1e-9
+    worst = 0.0   # adverse excursion in R (>=0)
+    best = 0.0    # favorable excursion in R (>=0)
+    bars = 0
     for c in candles[start_idx:]:
+        bars += 1
         if direction == "bullish":
+            worst = max(worst, (fill - c["low"]) / stop_dist)
+            best = max(best, (c["high"] - fill) / stop_dist)
             hit_sl, hit_tp = c["low"] <= stop, c["high"] >= target
         else:
+            worst = max(worst, (c["high"] - fill) / stop_dist)
+            best = max(best, (fill - c["low"]) / stop_dist)
             hit_sl, hit_tp = c["high"] >= stop, c["low"] <= target
         if hit_sl:
-            _book_exit(s, stop, "loss", c["time"]); return True
+            _book_exit(s, stop, "loss", c["time"], round(worst, 2), round(best, 2), bars)
+            return True
         if hit_tp:
-            _book_exit(s, target, "win", c["time"]); return True
+            _book_exit(s, target, "win", c["time"], round(worst, 2), round(best, 2), bars)
+            return True
     return False
 
 
@@ -744,7 +916,7 @@ def sim_tick():
             closed = _scan_exit(s, candles, start_idx=filled_idx)
             sb_upsert_signal(s)
             if closed:
-                _sim_send_exit(s)
+                _sim_send_exit(s, candles)
             continue
         if s["fill_status"] == "sim_filled":
             ft = s.get("fill_time") or ""
@@ -752,7 +924,7 @@ def sim_tick():
             closed = _scan_exit(s, candles, start_idx=start_idx)
             sb_upsert_signal(s)
             if closed:
-                _sim_send_exit(s)
+                _sim_send_exit(s, candles)
 
 
 def _sim_stats_text():
@@ -833,39 +1005,21 @@ def scan():
         sb_upsert_signal(record)   # durable: write this signal row to Supabase
         save_state()               # runtime flags to file
 
-        dir_label = "🟢 BUY" if bos["direction"] == "bullish" else "🔴 SELL"
-        atr_line = f"\n<b>Risk in ATR:</b> {record['risk_atr']}x ATR" if record["risk_atr"] else ""
-        msg = (f"📐 <b>SETUP · {INSTRUMENT_DISPLAY} · {dir_label}</b>\n"
-               f"#setup #{bos['direction']}\n\n"
-               f"<b>2H trend (context):</b> {trend_2h}\n"
-               f"<b>Session:</b> {record['session']}\n"
-               f"<b>Entry (OB):</b> {record['entry']:.2f}\n"
-               f"<b>Stop:</b> {record['stop']:.2f}\n"
-               f"<b>Target (3R):</b> {record['target']:.2f}\n"
-               f"<b>Risk distance:</b> {record['risk_distance']:.2f}{atr_line}\n\n"
-               f"<i>ID: {signal_id}</i>\n"
-               f"<i>Validate against TradingView. Not auto-traded.</i>")
-        send_telegram(msg)
-
+        # Two-cycle design: NO message at setup time. A setup that never fills
+        # (or expires at the 24h curfew) should stay silent — it surfaces only in
+        # /diag with its full specs in the DB. We message at ENTRY and EXIT only.
+        # Here we just host the chart (for the entry card + the web app) and write
+        # the specs fingerprint, then store the row durably.
         img = render_setup_chart(candles_15m, bos, ob, fvg, levels, trend_2h, signal_id)
         if img:
-            # Host the chart so the web app can show it, then tag the record.
             chart_url = sb_upload_chart(signal_id, img)
             if chart_url:
                 record["chart_url"] = chart_url
-            msg_id = send_telegram_photo(
-                img, f"{INSTRUMENT_DISPLAY} {dir_label} | 2H: {trend_2h} | "
-                     f"{record['session']} | E {record['entry']:.2f} / "
-                     f"SL {record['stop']:.2f} / 3R {record['target']:.2f} | {signal_id}\n"
-                     f"Grade this setup:",
-                reply_markup=grade_keyboard(signal_id))
-            if msg_id:
-                record["telegram_message_id"] = msg_id
-            # one durable write covering chart_url and/or telegram_message_id
-            if chart_url or msg_id:
-                sb_upsert_signal(record)
-                save_state()
-        log.info(f"SETUP {signal_id} ({bos['direction']}, 2H {trend_2h}, {record['session']})")
+        record["specs"] = _build_specs(record, ob, fvg, atr)
+        sb_upsert_signal(record)
+        save_state()
+        log.info(f"SETUP {signal_id} ({bos['direction']}, 2H {trend_2h}, "
+                 f"{record['session']}) — pending sim fill, silent until entry")
     except Exception as e:
         log.exception(f"scan: {e}")
 
